@@ -7,18 +7,9 @@
 
 //! Caching related functionality for the Resolver.
 
-use std::{
-    borrow::Cow,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc,
-    },
-    time::Instant,
-};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
 
-use futures_util::future::{Future, TryFutureExt};
-use hickory_proto::error::ProtoErrorKind;
+use futures_util::future::TryFutureExt;
 use once_cell::sync::Lazy;
 
 use crate::{
@@ -26,7 +17,6 @@ use crate::{
     error::ResolveError,
     lookup::Lookup,
     proto::{
-        error::{ForwardNSData, ProtoError},
         op::{Query, ResponseCode},
         rr::{
             domain::usage::{
@@ -38,31 +28,33 @@ use crate::{
             DNSClass, Name, RData, Record, RecordType,
         },
         xfer::{DnsHandle, DnsRequestOptions, DnsResponse, FirstAnswer},
+        {ForwardNSData, ProtoError, ProtoErrorKind},
     },
 };
-
-const MAX_QUERY_DEPTH: u8 = 8; // arbitrarily chosen number...
 
 static LOCALHOST: Lazy<RData> =
     Lazy::new(|| RData::PTR(PTR(Name::from_ascii("localhost.").unwrap())));
 static LOCALHOST_V4: Lazy<RData> = Lazy::new(|| RData::A(A::new(127, 0, 0, 1)));
 static LOCALHOST_V6: Lazy<RData> = Lazy::new(|| RData::AAAA(AAAA::new(0, 0, 0, 0, 0, 0, 0, 1)));
 
+/// Counts the depth of CNAME query resolutions.
+#[derive(Default, Clone, Copy)]
 struct DepthTracker {
-    query_depth: Arc<AtomicU8>,
+    query_depth: u8,
 }
 
 impl DepthTracker {
-    fn track(query_depth: Arc<AtomicU8>) -> Self {
-        query_depth.fetch_add(1, Ordering::Release);
-        Self { query_depth }
+    fn nest(self) -> Self {
+        Self {
+            query_depth: self.query_depth + 1,
+        }
     }
-}
 
-impl Drop for DepthTracker {
-    fn drop(&mut self) {
-        self.query_depth.fetch_sub(1, Ordering::Release);
+    fn is_exhausted(self) -> bool {
+        self.query_depth + 1 >= Self::MAX_QUERY_DEPTH
     }
+
+    const MAX_QUERY_DEPTH: u8 = 8; // arbitrarily chosen number...
 }
 
 // TODO: need to consider this storage type as it compares to Authority in server...
@@ -75,7 +67,6 @@ where
 {
     lru: DnsLru,
     client: C,
-    query_depth: Arc<AtomicU8>,
     preserve_intermediates: bool,
 }
 
@@ -93,11 +84,9 @@ where
     }
 
     pub(crate) fn with_cache(lru: DnsLru, client: C, preserve_intermediates: bool) -> Self {
-        let query_depth = Arc::new(AtomicU8::new(0));
         Self {
             lru,
             client,
-            query_depth,
             preserve_intermediates,
         }
     }
@@ -109,7 +98,14 @@ where
         options: DnsRequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Lookup, ResolveError>> + Send>> {
         Box::pin(
-            Self::inner_lookup(query, options, self.clone(), vec![]).map_err(ResolveError::from),
+            Self::inner_lookup(
+                query,
+                options,
+                self.clone(),
+                vec![],
+                DepthTracker::default(),
+            )
+            .map_err(ResolveError::from),
         )
     }
 
@@ -118,6 +114,7 @@ where
         options: DnsRequestOptions,
         mut client: Self,
         preserved_records: Vec<(Record, u32)>,
+        depth: DepthTracker,
     ) -> Result<Lookup, ProtoError> {
         // see https://tools.ietf.org/html/rfc6761
         //
@@ -148,12 +145,13 @@ where
                     RecordType::PTR => return Ok(Lookup::from_rdata(query, LOCALHOST.clone())),
                     _ => {
                         return Err(ProtoError::nx_error(
-                            query,
+                            Box::new(query),
                             None,
                             None,
                             None,
                             ResponseCode::NoError,
                             false,
+                            None,
                         ))
                     } // Are there any other types we can use?
                 },
@@ -162,19 +160,19 @@ where
                 ResolverUsage::LinkLocal => (),
                 ResolverUsage::NxDomain => {
                     return Err(ProtoError::nx_error(
-                        query,
+                        Box::new(query),
                         None,
                         None,
                         None,
                         ResponseCode::NXDomain,
                         false,
+                        None,
                     ))
                 }
                 ResolverUsage::Normal => (),
             }
         }
 
-        let _tracker = DepthTracker::track(client.query_depth.clone());
         let is_dnssec = client.client.is_verifying_dnssec();
 
         // first transition any polling that is needed (mutable refs...)
@@ -210,6 +208,7 @@ where
                         response_code,
                         trusted,
                         ns,
+                        ..
                     } => {
                         Err(Self::handle_nxdomain(
                             is_dnssec,
@@ -234,6 +233,7 @@ where
                     &query,
                     response_message,
                     preserved_records,
+                    depth,
                 )?;
 
                 Ok(records)
@@ -282,7 +282,7 @@ where
         valid_nsec: bool,
         query: Query,
         soa: Option<Record<SOA>>,
-        ns: Option<Vec<ForwardNSData>>,
+        ns: Option<Arc<[ForwardNSData]>>,
         negative_ttl: Option<u32>,
         response_code: ResponseCode,
         trusted: bool,
@@ -296,6 +296,7 @@ where
                 negative_ttl,
                 response_code,
                 trusted: true,
+                authorities: None,
             }
             .into()
         } else {
@@ -307,6 +308,7 @@ where
                 negative_ttl: None,
                 response_code,
                 trusted,
+                authorities: None,
             }
             .into()
         }
@@ -320,6 +322,7 @@ where
         query: &Query,
         response: DnsResponse,
         mut preserved_records: Vec<(Record, u32)>,
+        depth: DepthTracker,
     ) -> Result<Records, ProtoError> {
         // initial ttl is what CNAMES for min usage
         const INITIAL_TTL: u32 = dns_lru::MAX_TTL;
@@ -349,7 +352,7 @@ where
                         (Cow::Borrowed(query.name()), INITIAL_TTL, false),
                         |(search_name, cname_ttl, was_cname), r| {
                             match r.data() {
-                                RData::CNAME(CNAME(ref cname)) => {
+                                RData::CNAME(CNAME(cname)) => {
                                     // take the minimum TTL of the cname_ttl and the next record in the chain
                                     let ttl = cname_ttl.min(r.ttl());
                                     debug_assert_eq!(r.record_type(), RecordType::CNAME);
@@ -357,7 +360,7 @@ where
                                         return (Cow::Owned(cname.clone()), ttl, true);
                                     }
                                 }
-                                RData::SRV(ref srv) => {
+                                RData::SRV(srv) => {
                                     // take the minimum TTL of the cname_ttl and the next record in the chain
                                     let ttl = cname_ttl.min(r.ttl());
                                     debug_assert_eq!(r.record_type(), RecordType::SRV);
@@ -443,7 +446,7 @@ where
         // TODO: for SRV records we *could* do an implicit lookup, but, this requires knowing the type of IP desired
         //    for now, we'll make the API require the user to perform a follow up to the lookups.
         // It was a CNAME, but not included in the request...
-        if was_cname && client.query_depth.load(Ordering::Acquire) < MAX_QUERY_DEPTH {
+        if was_cname && !depth.is_exhausted() {
             let next_query = Query::query(search_name, query.query_type());
             Ok(Records::CnameChain {
                 next: Box::pin(Self::inner_lookup(
@@ -451,6 +454,7 @@ where
                     options,
                     client.clone(),
                     preserved_records,
+                    depth.nest(),
                 )),
                 min_ttl: cname_ttl,
             })
@@ -512,10 +516,10 @@ mod tests {
     use std::str::FromStr;
     use std::time::*;
 
+    use crate::proto::op::{Message, Query};
+    use crate::proto::rr::rdata::{NS, SRV};
+    use crate::proto::rr::{Name, Record};
     use futures_executor::block_on;
-    use proto::op::{Message, Query};
-    use proto::rr::rdata::{NS, SRV};
-    use proto::rr::{Name, Record};
 
     use super::*;
     use crate::lookup_ip::tests::*;
@@ -535,11 +539,12 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap_err()
         .kind()
         {
-            assert_eq!(**query, Query::new());
+            assert_eq!(*query, Box::new(Query::new()));
             assert_eq!(*negative_ttl, None);
         } else {
             panic!("wrong error received")
@@ -571,6 +576,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
@@ -588,10 +594,11 @@ mod tests {
         let client = CachingClient::with_cache(cache.clone(), client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
-            Query::new(),
+            Query::query(Name::root(), RecordType::A),
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
@@ -605,10 +612,11 @@ mod tests {
         let client = CachingClient::with_cache(cache, client, false);
 
         let ips = block_on(CachingClient::inner_lookup(
-            Query::new(),
+            Query::query(Name::root(), RecordType::A),
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .unwrap();
 
@@ -680,6 +688,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -717,6 +726,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -768,6 +778,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -803,7 +814,7 @@ mod tests {
     //             Name::from_str("actual.example.com.").unwrap(),
     //             86400,
     //             RecordType::A,
-    //             RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+    //             RData::A(Ipv4Addr::LOCALHOST),
     //         ),
     //     ]);
 
@@ -829,7 +840,7 @@ mod tests {
     //                 443,
     //                 Name::from_str("www.example.com.").unwrap(),
     //             )),
-    //             RData::A(Ipv4Addr::new(127, 0, 0, 1)),
+    //             RData::A(Ipv4Addr::LOCALHOST),
     //             //RData::AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
     //         ]
     //     );
@@ -869,6 +880,7 @@ mod tests {
             DnsRequestOptions::default(),
             client,
             vec![],
+            DepthTracker::default(),
         ))
         .expect("lookup failed");
 
@@ -906,6 +918,7 @@ mod tests {
             &Query::query(Name::from_str("ttl.example.com.").unwrap(), RecordType::A),
             DnsResponse::from_message(message).unwrap(),
             vec![],
+            DepthTracker::default(),
         );
 
         if let Ok(records) = records {
@@ -959,7 +972,7 @@ mod tests {
         }
 
         {
-            let query = Query::query(Name::from(Ipv4Addr::new(127, 0, 0, 1)), RecordType::PTR);
+            let query = Query::query(Name::from(Ipv4Addr::LOCALHOST), RecordType::PTR);
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
             assert_eq!(lookup.query(), &query);
@@ -990,7 +1003,7 @@ mod tests {
         .is_err());
 
         assert!(block_on(client.lookup(
-            Query::query(Name::from(Ipv4Addr::new(127, 0, 0, 1)), RecordType::MX),
+            Query::query(Name::from(Ipv4Addr::LOCALHOST), RecordType::MX),
             DnsRequestOptions::default()
         ))
         .is_err());

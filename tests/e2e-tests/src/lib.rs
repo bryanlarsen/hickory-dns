@@ -2,6 +2,8 @@
 
 use std::env;
 
+mod client;
+mod recursor;
 mod resolver;
 
 #[test]

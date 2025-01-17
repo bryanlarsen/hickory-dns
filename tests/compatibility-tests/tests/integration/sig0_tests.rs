@@ -5,46 +5,41 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::env;
-use std::fs::File;
-use std::io::Read;
-#[cfg(not(feature = "none"))]
+#![cfg(not(feature = "none"))]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
+use std::sync::Arc;
 
-use openssl::rsa::Rsa;
-#[cfg(not(feature = "none"))]
+use rustls_pki_types::PrivatePkcs8KeyDer;
 use time::Duration;
 
-#[cfg(not(feature = "none"))]
 use hickory_client::client::Client;
-use hickory_client::client::{ClientConnection, SyncClient};
-#[cfg(not(feature = "none"))]
+use hickory_client::client::ClientHandle;
+use hickory_client::proto::dnssec::rdata::key::{KeyUsage, KEY};
+use hickory_client::proto::dnssec::ring::RsaSigningKey;
+use hickory_client::proto::dnssec::{Algorithm, SigSigner, SigningKey};
 use hickory_client::proto::op::ResponseCode;
-use hickory_client::proto::rr::dnssec::rdata::key::{KeyUsage, KEY};
-use hickory_client::proto::rr::dnssec::{Algorithm, KeyPair, SigSigner};
-use hickory_client::proto::rr::Name;
-#[cfg(not(feature = "none"))]
-use hickory_client::proto::rr::{DNSClass, RData, Record, RecordType};
-#[cfg(not(feature = "none"))]
-use hickory_client::udp::UdpClientConnection;
-#[cfg(not(feature = "none"))]
+use hickory_client::proto::rr::rdata::A;
+use hickory_client::proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_client::proto::runtime::TokioRuntimeProvider;
+use hickory_client::proto::udp::UdpClientStream;
 use hickory_compatibility::named_process;
 
-#[cfg(not(feature = "none"))]
-#[test]
-#[allow(unused)]
-fn test_get() {
-    use hickory_client::proto::rr::rdata::A;
+#[tokio::test]
+async fn test_get() {
+    test_support::subscribe();
 
-    let (process, port) = named_process();
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-    let conn = UdpClientConnection::new(socket).unwrap();
-    let client = SyncClient::new(conn);
+    let (_process, port) = named_process();
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let conn = UdpClientStream::builder(socket, TokioRuntimeProvider::default()).build();
+    let (mut client, driver) = Client::connect(conn).await.expect("failed to connect");
+    tokio::spawn(driver);
 
     let name = Name::from_str("www.example.com.").unwrap();
     let result = client
-        .query(&name, DNSClass::IN, RecordType::A)
+        .query(name, DNSClass::IN, RecordType::A)
+        .await
         .expect("query failed");
     assert_eq!(result.response_code(), ResponseCode::NoError);
     assert_eq!(result.answers().len(), 1);
@@ -58,50 +53,36 @@ fn test_get() {
     }
 }
 
-#[allow(unused)]
-fn create_sig0_ready_client<CC>(conn: CC) -> SyncClient<CC>
-where
-    CC: ClientConnection,
-{
-    let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "../..".to_owned());
-    let pem_path = format!(
-        "{server_path}/tests/compatibility-tests/tests/conf/Kupdate.example.com.+008+56935.pem"
-    );
-    println!("loading pem from: {pem_path}");
-    let mut pem = File::open(pem_path).expect("could not find pem file");
+#[tokio::test]
+async fn test_create() {
+    test_support::subscribe();
 
-    let mut pem_buf = Vec::<u8>::new();
-    pem.read_to_end(&mut pem_buf).expect("failed to read pem");
-    let rsa = Rsa::private_key_from_pem(&pem_buf).expect("something wrong with key from pem");
-    let key = KeyPair::from_rsa(rsa).unwrap();
+    const KEY: &[u8] = include_bytes!("../conf/Kupdate.example.com.+008+56935.pk8");
+    let key =
+        RsaSigningKey::from_pkcs8(&PrivatePkcs8KeyDer::from(KEY), Algorithm::RSASHA256).unwrap();
     let sig0key = KEY::new(
         Default::default(),
         KeyUsage::Entity,
         Default::default(),
         Default::default(),
         Algorithm::RSASHA256,
-        key.to_public_bytes().unwrap(),
+        key.to_public_key().unwrap().into_inner(),
     );
 
-    let signer = SigSigner::sig0(sig0key, key, Name::from_str("update.example.com").unwrap());
+    let signer = SigSigner::sig0(
+        sig0key,
+        Box::new(key),
+        Name::from_str("update.example.com.").unwrap(),
+    );
+    assert_eq!(signer.calculate_key_tag().unwrap(), 56935);
 
-    assert_eq!(signer.calculate_key_tag().unwrap(), 56935_u16);
-
-    SyncClient::with_signer(conn, signer)
-}
-
-#[cfg(not(feature = "none"))]
-#[test]
-#[allow(unused)]
-fn test_create() {
-    use hickory_client::proto::rr::rdata::A;
-
-    let (process, port) = named_process();
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-    let conn = UdpClientConnection::new(socket).unwrap();
-
-    let client = create_sig0_ready_client(conn);
-    let origin = Name::from_str("example.com.").unwrap();
+    let (_process, port) = named_process();
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let conn = UdpClientStream::builder(socket, TokioRuntimeProvider::default())
+        .with_signer(Some(Arc::new(signer)))
+        .build();
+    let (mut client, driver) = Client::connect(conn).await.expect("failed to connect");
+    tokio::spawn(driver);
 
     // create a record
     let mut record = Record::from_rdata(
@@ -110,12 +91,19 @@ fn test_create() {
         RData::A(A::new(100, 10, 100, 10)),
     );
 
+    let origin = Name::from_str("example.com.").unwrap();
     let result = client
         .create(record.clone(), origin.clone())
+        .await
         .expect("create failed");
     assert_eq!(result.response_code(), ResponseCode::NoError);
     let result = client
-        .query(record.name(), record.dns_class(), record.record_type())
+        .query(
+            record.name().clone(),
+            record.dns_class(),
+            record.record_type(),
+        )
+        .await
         .expect("query failed");
     assert_eq!(result.response_code(), ResponseCode::NoError);
     assert_eq!(result.answers().len(), 1);
@@ -125,13 +113,14 @@ fn test_create() {
     // TODO: it would be cool to make this
     let result = client
         .create(record.clone(), origin.clone())
+        .await
         .expect("create failed");
     assert_eq!(result.response_code(), ResponseCode::YXRRSet);
 
     // will fail if already set and not the same value.
     record.set_data(RData::A(A::new(101, 11, 101, 11)));
 
-    let result = client.create(record, origin).expect("create failed");
+    let result = client.create(record, origin).await.expect("create failed");
     assert_eq!(result.response_code(), ResponseCode::YXRRSet);
 }
 

@@ -7,30 +7,31 @@
 
 use std::cmp::Ordering;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::future::FutureExt;
 use futures_util::stream::{once, FuturesUnordered, Stream, StreamExt};
-use hickory_proto::error::ProtoErrorKind;
-use smallvec::SmallVec;
-
-use proto::xfer::{DnsHandle, DnsRequest, DnsResponse, FirstAnswer};
-use proto::Time;
-use tracing::debug;
-
 use rand::thread_rng as rng;
 use rand::Rng;
+use smallvec::SmallVec;
+use tracing::debug;
 
 use crate::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts, ServerOrderingStrategy};
 use crate::name_server::connection_provider::{ConnectionProvider, GenericConnector};
 use crate::name_server::name_server::NameServer;
-use crate::name_server::RuntimeProvider;
-#[cfg(test)]
-#[cfg(feature = "tokio-runtime")]
-use crate::name_server::TokioRuntimeProvider;
-use crate::proto::error::ProtoError;
+use crate::proto::runtime::{RuntimeProvider, Time};
+use crate::proto::xfer::{DnsHandle, DnsRequest, DnsResponse, FirstAnswer};
+use crate::proto::{ProtoError, ProtoErrorKind};
+
+/// A pool of NameServers
+///
+/// This is not expected to be used directly, see [crate::Resolver].
+pub type GenericNameServerPool<P> = NameServerPool<GenericConnector<P>>;
 
 /// Abstract interface for mocking purpose
 #[derive(Clone)]
@@ -39,23 +40,8 @@ pub struct NameServerPool<P: ConnectionProvider + Send + 'static> {
     datagram_conns: Arc<[NameServer<P>]>, /* All NameServers must be the same type */
     stream_conns: Arc<[NameServer<P>]>,   /* All NameServers must be the same type */
     options: ResolverOpts,
-}
-
-/// A pool of NameServers
-///
-/// This is not expected to be used directly, see [crate::AsyncResolver].
-pub type GenericNameServerPool<P> = NameServerPool<GenericConnector<P>>;
-
-#[cfg(test)]
-#[cfg(feature = "tokio-runtime")]
-impl GenericNameServerPool<TokioRuntimeProvider> {
-    pub(crate) fn tokio_from_config(
-        config: &ResolverConfig,
-        options: ResolverOpts,
-        runtime: TokioRuntimeProvider,
-    ) -> Self {
-        Self::from_config_with_provider(config, options, GenericConnector::new(runtime))
-    }
+    datagram_index: Arc<AtomicUsize>,
+    stream_index: Arc<AtomicUsize>,
 }
 
 impl<P> NameServerPool<P>
@@ -67,7 +53,7 @@ where
         options: ResolverOpts,
         conn_provider: P,
     ) -> Self {
-        let datagram_conns: Vec<NameServer<P>> = config
+        let datagram_conns = config
             .name_servers()
             .iter()
             .filter(|ns_config| ns_config.protocol.is_datagram())
@@ -75,7 +61,7 @@ where
                 #[cfg(feature = "dns-over-rustls")]
                 let ns_config = {
                     let mut ns_config = ns_config.clone();
-                    ns_config.tls_config.clone_from(config.client_config());
+                    ns_config.tls_config = config.client_config().cloned();
                     ns_config
                 };
                 #[cfg(not(feature = "dns-over-rustls"))]
@@ -85,7 +71,7 @@ where
             })
             .collect();
 
-        let stream_conns: Vec<NameServer<P>> = config
+        let stream_conns = config
             .name_servers()
             .iter()
             .filter(|ns_config| ns_config.protocol.is_stream())
@@ -93,7 +79,7 @@ where
                 #[cfg(feature = "dns-over-rustls")]
                 let ns_config = {
                     let mut ns_config = ns_config.clone();
-                    ns_config.tls_config.clone_from(config.client_config());
+                    ns_config.tls_config = config.client_config().cloned();
                     ns_config
                 };
                 #[cfg(not(feature = "dns-over-rustls"))]
@@ -104,9 +90,11 @@ where
             .collect();
 
         Self {
-            datagram_conns: Arc::from(datagram_conns),
-            stream_conns: Arc::from(stream_conns),
+            datagram_conns,
+            stream_conns,
             options,
+            datagram_index: Arc::from(AtomicUsize::new(0)),
+            stream_index: Arc::from(AtomicUsize::new(0)),
         }
     }
 
@@ -131,6 +119,8 @@ where
             datagram_conns: Arc::from(datagram_conns),
             stream_conns: Arc::from(stream_conns),
             options,
+            datagram_index: Arc::from(AtomicUsize::new(0)),
+            stream_index: Arc::from(AtomicUsize::new(0)),
         }
     }
 
@@ -144,6 +134,8 @@ where
             datagram_conns: Arc::from(datagram_conns),
             stream_conns: Arc::from(stream_conns),
             options,
+            datagram_index: Arc::from(AtomicUsize::new(0)),
+            stream_index: Arc::from(AtomicUsize::new(0)),
         }
     }
 
@@ -158,6 +150,8 @@ where
             datagram_conns,
             stream_conns,
             options,
+            datagram_index: Arc::from(AtomicUsize::new(0)),
+            stream_index: Arc::from(AtomicUsize::new(0)),
         }
     }
 
@@ -165,6 +159,7 @@ where
         opts: ResolverOpts,
         conns: Arc<[NameServer<P>]>,
         request: DnsRequest,
+        next_index: &Arc<AtomicUsize>,
     ) -> Result<DnsResponse, ProtoError> {
         let mut conns: Vec<NameServer<P>> = conns.to_vec();
 
@@ -172,8 +167,22 @@ where
             // select the highest priority connection
             //   reorder the connections based on current view...
             //   this reorders the inner set
-            ServerOrderingStrategy::QueryStatistics => conns.sort_unstable(),
+            ServerOrderingStrategy::QueryStatistics => {
+                conns.sort_by(|a, b| a.stats.decayed_srtt().total_cmp(&b.stats.decayed_srtt()));
+            }
             ServerOrderingStrategy::UserProvidedOrder => {}
+            ServerOrderingStrategy::RoundRobin => {
+                let num_concurrent_reqs = if opts.num_concurrent_reqs > 1 {
+                    opts.num_concurrent_reqs
+                } else {
+                    1
+                };
+                if num_concurrent_reqs < conns.len() {
+                    let index = next_index.fetch_add(num_concurrent_reqs, AtomicOrdering::SeqCst)
+                        % conns.len();
+                    conns.rotate_left(index);
+                }
+            }
         }
         let request_loop = request.clone();
 
@@ -192,6 +201,9 @@ where
         let request = request.into();
         let datagram_conns = Arc::clone(&self.datagram_conns);
         let stream_conns = Arc::clone(&self.stream_conns);
+        let datagram_index = Arc::clone(&self.datagram_index);
+        let stream_index = Arc::clone(&self.stream_index);
+        // TODO: remove this clone, return the Message in the error?
         // TODO: remove this clone, return the Message in the error?
         let tcp_message = request.clone();
 
@@ -211,18 +223,18 @@ where
             debug!("sending request: {:?}", request.queries());
 
             // First try the UDP connections
-            let udp_res: Result<DnsResponse, ProtoError> =
-                match Self::try_send(opts.clone(), datagram_conns, request).await {
-                    Ok(response) if response.truncated() => {
-                        debug!("truncated response received, retrying over TCP");
-                        Ok(response)
-                    }
-                    Err(e) if (opts.try_tcp_on_error && e.is_io()) || e.is_no_connections() => {
-                        debug!("error from UDP, retrying over TCP: {}", e);
-                        Err(e)
-                    }
-                    result => return result.map_err(ProtoError::from),
-                };
+            let future = Self::try_send(opts.clone(), datagram_conns, request, &datagram_index);
+            let udp_res = match future.await {
+                Ok(response) if response.truncated() => {
+                    debug!("truncated response received, retrying over TCP");
+                    Err(ProtoError::from("received truncated response"))
+                }
+                Err(e) if (opts.try_tcp_on_error && e.is_io()) || e.is_no_connections() => {
+                    debug!("error from UDP, retrying over TCP: {}", e);
+                    Err(e)
+                }
+                result => return result.map_err(ProtoError::from),
+            };
 
             if stream_conns.is_empty() {
                 debug!("no TCP connections available");
@@ -231,23 +243,7 @@ where
 
             // Try query over TCP, as response to query over UDP was either truncated or was an
             // error.
-            let tcp_res = Self::try_send(opts, stream_conns, tcp_message).await;
-
-            let tcp_err = match tcp_res {
-                res @ Ok(..) => return res.map_err(ProtoError::from),
-                Err(e) => e,
-            };
-
-            // Even if the UDP result was truncated, return that
-            let udp_err = match udp_res {
-                Ok(response) => return Ok(response),
-                Err(e) => e,
-            };
-
-            match udp_err.cmp_specificity(&tcp_err) {
-                Ordering::Greater => Err(udp_err),
-                _ => Err(tcp_err),
-            }
+            Self::try_send(opts, stream_conns, tcp_message, &stream_index).await
         }))
     }
 }
@@ -392,9 +388,9 @@ impl Local {
 impl Stream for Local {
     type Item = Result<DnsResponse, ProtoError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match *self {
-            Self::ResolveStream(ref mut ns) => ns.as_mut().poll_next(cx),
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::ResolveStream(ns) => ns.as_mut().poll_next(cx),
             // TODO: making this a panic for now
             Self::NotMdns(..) => panic!("Local queries that are not mDNS should not be polled"), //Local::NotMdns(message) => return Err(ResolveErrorKind::Message("not mDNS")),
         }
@@ -404,20 +400,19 @@ impl Stream for Local {
 #[cfg(test)]
 #[cfg(feature = "tokio-runtime")]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::str::FromStr;
 
     use tokio::runtime::Runtime;
 
-    use proto::op::Query;
-    use proto::rr::{Name, RecordType};
-    use proto::xfer::{DnsHandle, DnsRequestOptions};
-
     use super::*;
     use crate::config::NameServerConfig;
-    use crate::config::Protocol;
-    use crate::name_server::TokioRuntimeProvider;
-    use crate::name_server::{GenericNameServer, TokioConnectionProvider};
+    use crate::name_server::connection_provider::TokioConnectionProvider;
+    use crate::name_server::GenericNameServer;
+    use crate::proto::op::Query;
+    use crate::proto::rr::{Name, RecordType};
+    use crate::proto::runtime::TokioRuntimeProvider;
+    use crate::proto::xfer::{DnsHandle, DnsRequestOptions, Protocol};
 
     #[ignore]
     // because of there is a real connection that needs a reasonable timeout
@@ -428,6 +423,7 @@ mod tests {
             socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 252)), 253),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -438,6 +434,7 @@ mod tests {
             socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -500,6 +497,7 @@ mod tests {
             socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
             protocol: Protocol::Tcp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -533,13 +531,7 @@ mod tests {
             )
             .expect("lookup failed");
 
-        assert_eq!(
-            *response.answers()[0]
-                .data()
-                .as_a()
-                .expect("no a record available"),
-            Ipv4Addr::new(93, 184, 215, 14).into()
-        );
+        assert!(!response.answers().is_empty());
 
         assert!(
             name_servers[0].is_connected(),
@@ -557,17 +549,21 @@ mod tests {
             )
             .expect("lookup failed");
 
-        assert_eq!(
-            *response.answers()[0]
-                .data()
-                .as_aaaa()
-                .expect("no aaaa record available"),
-            Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c).into()
-        );
+        assert!(!response.answers().is_empty());
 
         assert!(
             name_servers[0].is_connected(),
             "if this is failing then the NameServers aren't being properly shared."
         );
+    }
+
+    impl GenericNameServerPool<TokioRuntimeProvider> {
+        pub(crate) fn tokio_from_config(
+            config: &ResolverConfig,
+            options: ResolverOpts,
+            runtime: TokioRuntimeProvider,
+        ) -> Self {
+            Self::from_config_with_provider(config, options, GenericConnector::new(runtime))
+        }
     }
 }

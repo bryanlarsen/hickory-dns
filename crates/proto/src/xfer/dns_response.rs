@@ -19,6 +19,9 @@ use std::{
 use futures_channel::mpsc;
 use futures_util::{ready, stream::Stream};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::{
     error::{ProtoError, ProtoErrorKind, ProtoResult},
     op::{Message, ResponseCode},
@@ -40,7 +43,7 @@ impl DnsResponseStream {
 impl Stream for DnsResponseStream {
     type Item = Result<DnsResponse, ProtoError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use DnsResponseStreamInner::*;
 
         // if the standard futures are done, don't poll again
@@ -49,10 +52,7 @@ impl Stream for DnsResponseStream {
         }
 
         // split mutable refs to Self
-        let Self {
-            ref mut inner,
-            ref mut done,
-        } = *self.as_mut();
+        let Self { inner, done } = self.get_mut();
 
         let result = match inner {
             Timeout(fut) => {
@@ -63,7 +63,7 @@ impl Stream for DnsResponseStream {
                 *done = true;
                 x
             }
-            Receiver(ref mut fut) => match ready!(Pin::new(fut).poll_next(cx)) {
+            Receiver(fut) => match ready!(Pin::new(fut).poll_next(cx)) {
                 Some(x) => x,
                 None => return Poll::Ready(None),
             },
@@ -131,6 +131,7 @@ type TimeoutFuture = Pin<
 ///
 /// For Most DNS requests, only one response is expected, the exception is a multicast request.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct DnsResponse {
     message: Message,
     buffer: Vec<u8>,
@@ -138,17 +139,20 @@ pub struct DnsResponse {
 
 // TODO: when `impl Trait` lands in stable, remove this, and expose FlatMap over answers, et al.
 impl DnsResponse {
-    /// Constructs a new DnsResponse
-    pub fn new(message: Message, buffer: Vec<u8>) -> Self {
-        Self { message, buffer }
-    }
-
     /// Constructs a new DnsResponse with a buffer synthesized from the message
     pub fn from_message(message: Message) -> Result<Self, ProtoError> {
         Ok(Self {
             buffer: message.to_vec()?,
             message,
         })
+    }
+
+    /// Constructs a new DnsResponse by parsing a message from a buffer.
+    ///
+    /// Returns an error if the response message cannot be decoded.
+    pub fn from_buffer(buffer: Vec<u8>) -> Result<Self, ProtoError> {
+        let message = Message::from_vec(&buffer)?;
+        Ok(Self { message, buffer })
     }
 
     /// Retrieves the SOA from the response. This will only exist if it was an authoritative response.
@@ -259,7 +263,7 @@ impl DnsResponse {
     pub fn negative_type(&self) -> Option<NegativeType> {
         let response_code = self.response_code();
         let ttl_from_soa = self.negative_ttl();
-        let has_soa = ttl_from_soa.map_or(false, |_| true);
+        let has_soa = ttl_from_soa.is_some();
         let has_ns_records = self.name_servers().iter().any(|r| r.record_type().is_ns());
         let has_cname = self.answers().iter().any(|r| r.record_type().is_cname());
         let has_non_cname = self.answers().iter().any(|r| !r.record_type().is_cname());
@@ -358,7 +362,7 @@ impl From<DnsResponse> for Message {
 ///    and the authority section may have SOA, NXT [RFC2065] and SIG RRsets.
 ///
 ///    It is possible to distinguish between a referral and a NXDOMAIN
-///    response by the presense of NXDOMAIN in the RCODE regardless of the
+///    response by the presence of NXDOMAIN in the RCODE regardless of the
 ///    presence of NS or SOA records in the authority section.
 ///
 ///    NXDOMAIN responses can be categorised into four types by the contents

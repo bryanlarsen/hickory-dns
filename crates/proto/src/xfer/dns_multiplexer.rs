@@ -34,11 +34,12 @@ use tracing::debug;
 use crate::{
     error::{ProtoError, ProtoErrorKind},
     op::{MessageFinalizer, MessageVerifier},
+    runtime::Time,
     xfer::{
         ignore_send, BufDnsStreamHandle, DnsClientStream, DnsRequest, DnsRequestSender,
         DnsResponse, DnsResponseStream, SerialMessage, CHANNEL_BUFFER_SIZE,
     },
-    DnsStreamHandle, Time,
+    DnsStreamHandle,
 };
 
 const QOS_MAX_RECEIVE_MSGS: usize = 100; // max number of messages to receive from the UDP socket
@@ -94,23 +95,21 @@ impl ActiveRequest {
 ///  implementations. This should be used for underlying protocols that do not natively support
 ///  multiplexed sessions.
 #[must_use = "futures do nothing unless polled"]
-pub struct DnsMultiplexer<S, MF>
+pub struct DnsMultiplexer<S>
 where
     S: DnsClientStream + 'static,
-    MF: MessageFinalizer,
 {
     stream: S,
     timeout_duration: Duration,
     stream_handle: BufDnsStreamHandle,
     active_requests: HashMap<u16, ActiveRequest>,
-    signer: Option<Arc<MF>>,
+    signer: Option<Arc<dyn MessageFinalizer>>,
     is_shutdown: bool,
 }
 
-impl<S, MF> DnsMultiplexer<S, MF>
+impl<S> DnsMultiplexer<S>
 where
     S: DnsClientStream + Unpin + 'static,
-    MF: MessageFinalizer,
 {
     /// Spawns a new DnsMultiplexer Stream. This uses a default timeout of 5 seconds for all requests.
     ///
@@ -124,8 +123,8 @@ where
     pub fn new<F>(
         stream: F,
         stream_handle: BufDnsStreamHandle,
-        signer: Option<Arc<MF>>,
-    ) -> DnsMultiplexerConnect<F, S, MF>
+        signer: Option<Arc<dyn MessageFinalizer>>,
+    ) -> DnsMultiplexerConnect<F, S>
     where
         F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
     {
@@ -146,8 +145,8 @@ where
         stream: F,
         stream_handle: BufDnsStreamHandle,
         timeout_duration: Duration,
-        signer: Option<Arc<MF>>,
-    ) -> DnsMultiplexerConnect<F, S, MF>
+        signer: Option<Arc<dyn MessageFinalizer>>,
+    ) -> DnsMultiplexerConnect<F, S>
     where
         F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
     {
@@ -163,7 +162,7 @@ where
     ///  this should free up space if we already had 4096 active requests
     fn drop_cancelled(&mut self, cx: &mut Context<'_>) {
         let mut canceled = HashMap::<u16, ProtoError>::new();
-        for (&id, ref mut active_req) in &mut self.active_requests {
+        for (&id, active_req) in &mut self.active_requests {
             if active_req.is_canceled() {
                 canceled.insert(id, ProtoError::from("requestor canceled"));
             }
@@ -217,25 +216,23 @@ where
 
 /// A wrapper for a future DnsExchange connection
 #[must_use = "futures do nothing unless polled"]
-pub struct DnsMultiplexerConnect<F, S, MF>
+pub struct DnsMultiplexerConnect<F, S>
 where
     F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
     S: Stream<Item = Result<SerialMessage, ProtoError>> + Unpin,
-    MF: MessageFinalizer + Send + Sync + 'static,
 {
     stream: F,
     stream_handle: Option<BufDnsStreamHandle>,
     timeout_duration: Duration,
-    signer: Option<Arc<MF>>,
+    signer: Option<Arc<dyn MessageFinalizer>>,
 }
 
-impl<F, S, MF> Future for DnsMultiplexerConnect<F, S, MF>
+impl<F, S> Future for DnsMultiplexerConnect<F, S>
 where
     F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
     S: DnsClientStream + Unpin + 'static,
-    MF: MessageFinalizer + Send + Sync + 'static,
 {
-    type Output = Result<DnsMultiplexer<S, MF>, ProtoError>;
+    type Output = Result<DnsMultiplexer<S>, ProtoError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let stream: S = ready!(self.stream.poll_unpin(cx))?;
@@ -254,20 +251,18 @@ where
     }
 }
 
-impl<S, MF> Display for DnsMultiplexer<S, MF>
+impl<S> Display for DnsMultiplexer<S>
 where
     S: DnsClientStream + 'static,
-    MF: MessageFinalizer + Send + Sync + 'static,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(formatter, "{}", self.stream)
     }
 }
 
-impl<S, MF> DnsRequestSender for DnsMultiplexer<S, MF>
+impl<S> DnsRequestSender for DnsMultiplexer<S>
 where
     S: DnsClientStream + Unpin + 'static,
-    MF: MessageFinalizer + Send + Sync + 'static,
 {
     fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
         if self.is_shutdown {
@@ -295,9 +290,9 @@ where
         let now = now as u32;
 
         let mut verifier = None;
-        if let Some(ref signer) = self.signer {
+        if let Some(signer) = &self.signer {
             if signer.should_finalize_message(&request) {
-                match request.finalize::<MF>(signer.borrow(), now) {
+                match request.finalize(signer.borrow(), now) {
                     Ok(answer_verifier) => verifier = answer_verifier,
                     Err(e) => {
                         debug!("could not sign message: {}", e);
@@ -360,10 +355,9 @@ where
     }
 }
 
-impl<S, MF> Stream for DnsMultiplexer<S, MF>
+impl<S> Stream for DnsMultiplexer<S>
 where
     S: DnsClientStream + Unpin + 'static,
-    MF: MessageFinalizer + Send + Sync + 'static,
 {
     type Item = Result<(), ProtoError>;
 
@@ -386,24 +380,22 @@ where
                     messages_received = i;
 
                     //   deserialize or log decode_error
-                    match buffer.to_message() {
-                        Ok(message) => match self.active_requests.entry(message.id()) {
+                    match DnsResponse::from_buffer(buffer.into_parts().0) {
+                        Ok(response) => match self.active_requests.entry(response.id()) {
                             Entry::Occupied(mut request_entry) => {
                                 // send the response, complete the request...
                                 let active_request = request_entry.get_mut();
-                                if let Some(ref mut verifier) = active_request.verifier {
+                                if let Some(verifier) = &mut active_request.verifier {
                                     ignore_send(
                                         active_request
                                             .completion
-                                            .try_send(verifier(buffer.bytes())),
+                                            .try_send(verifier(response.as_buffer())),
                                     );
                                 } else {
-                                    ignore_send(active_request.completion.try_send(Ok(
-                                        DnsResponse::new(message, buffer.into_parts().0),
-                                    )));
+                                    ignore_send(active_request.completion.try_send(Ok(response)));
                                 }
                             }
-                            Entry::Vacant(..) => debug!("unexpected request_id: {}", message.id()),
+                            Entry::Vacant(..) => debug!("unexpected request_id: {}", response.id()),
                         },
                         // TODO: return src address for diagnostics
                         Err(error) => debug!(error = error.as_dyn(), "error decoding message"),
@@ -440,7 +432,6 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::op::message::NoopMessageFinalizer;
     use crate::op::op_code::OpCode;
     use crate::op::{Message, MessageType, Query};
     use crate::rr::record_type::RecordType;
@@ -510,7 +501,7 @@ mod test {
     }
 
     impl DnsClientStream for MockClientStream {
-        type Time = crate::TokioTime;
+        type Time = crate::runtime::TokioTime;
 
         fn name_server_addr(&self) -> SocketAddr {
             self.addr
@@ -519,7 +510,7 @@ mod test {
 
     async fn get_mocked_multiplexer(
         mock_response: Vec<Message>,
-    ) -> DnsMultiplexer<MockClientStream, NoopMessageFinalizer> {
+    ) -> DnsMultiplexer<MockClientStream> {
         let addr = SocketAddr::from(([127, 0, 0, 1], 1234));
         let mock_response = MockClientStream::new(mock_response, addr);
         let (handler, receiver) = BufDnsStreamHandle::new(addr);
@@ -534,7 +525,7 @@ mod test {
     }
 
     fn a_query_answer() -> (DnsRequest, Vec<Message>) {
-        let name = Name::from_ascii("www.example.com").unwrap();
+        let name = Name::from_ascii("www.example.com.").unwrap();
 
         let mut msg = Message::new();
         msg.add_query({
@@ -563,7 +554,7 @@ mod test {
     }
 
     fn axfr_query() -> Message {
-        let name = Name::from_ascii("example.com").unwrap();
+        let name = Name::from_ascii("example.com.").unwrap();
 
         let mut msg = Message::new();
         msg.add_query({
@@ -579,7 +570,7 @@ mod test {
 
     fn axfr_response() -> Vec<Record> {
         use crate::rr::rdata::*;
-        let origin = Name::from_ascii("example.com").unwrap();
+        let origin = Name::from_ascii("example.com.").unwrap();
         let soa = Record::from_rdata(
             origin.clone(),
             3600,

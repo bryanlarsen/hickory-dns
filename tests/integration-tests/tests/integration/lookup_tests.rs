@@ -7,17 +7,14 @@ use std::{
 use tokio::runtime::Runtime;
 
 use hickory_proto::{
-    op::{NoopMessageFinalizer, Query},
+    op::Query,
     rr::{rdata::A, DNSClass, Name, RData, Record, RecordType},
+    runtime::TokioTime,
     xfer::{DnsExchange, DnsMultiplexer, DnsResponse},
-    TokioTime,
 };
 use hickory_resolver::{
-    caching_client::CachingClient,
-    config::LookupIpStrategy,
-    lookup::{Lookup, LookupFuture},
-    lookup_ip::LookupIpFuture,
-    Hosts,
+    caching_client::CachingClient, config::LookupIpStrategy, lookup::Lookup,
+    lookup_ip::LookupIpFuture, Hosts, LookupFuture,
 };
 use hickory_server::{
     authority::{Authority, Catalog},
@@ -30,15 +27,15 @@ use hickory_integration::{example_authority::create_example, mock_client::*, Tes
 fn test_lookup() {
     let authority = create_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let dns_conn = DnsMultiplexer::new(stream, sender, NoopMessageFinalizer::new());
+    let dns_conn = DnsMultiplexer::new(stream, sender, None);
     let client = DnsExchange::connect::<_, _, TokioTime>(dns_conn);
 
     let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let lookup = LookupFuture::lookup(
         vec![Name::from_str("www.example.com.").unwrap()],
@@ -58,15 +55,15 @@ fn test_lookup() {
 fn test_lookup_hosts() {
     let authority = create_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let dns_conn = DnsMultiplexer::new(stream, sender, NoopMessageFinalizer::new());
+    let dns_conn = DnsMultiplexer::new(stream, sender, None);
 
     let client = DnsExchange::connect::<_, _, TokioTime>(dns_conn);
     let (client, bg) = io_loop.block_on(client).expect("client connect failed");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let mut hosts = Hosts::default();
     let record = Record::from_rdata(
@@ -116,15 +113,15 @@ fn create_ip_like_example() -> InMemoryAuthority {
 fn test_lookup_ipv4_like() {
     let authority = create_ip_like_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let dns_conn = DnsMultiplexer::new(stream, sender, NoopMessageFinalizer::new());
+    let dns_conn = DnsMultiplexer::new(stream, sender, None);
 
     let client = DnsExchange::connect::<_, _, TokioTime>(dns_conn);
     let (client, bg) = io_loop.block_on(client).expect("client connect failed");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let lookup = LookupIpFuture::lookup(
         vec![Name::from_str("1.2.3.4.example.com.").unwrap()],
@@ -146,15 +143,15 @@ fn test_lookup_ipv4_like() {
 fn test_lookup_ipv4_like_fall_through() {
     let authority = create_ip_like_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let dns_conn = DnsMultiplexer::new(stream, sender, NoopMessageFinalizer::new());
+    let dns_conn = DnsMultiplexer::new(stream, sender, None);
 
     let client = DnsExchange::connect::<_, _, TokioTime>(dns_conn);
     let (client, bg) = io_loop.block_on(client).expect("client connect failed");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let lookup = LookupIpFuture::lookup(
         vec![Name::from_str("198.51.100.35.example.com.").unwrap()],
@@ -450,8 +447,8 @@ fn test_max_chained_lookup_depth() {
 // no NS records present (!ns.is_some())
 #[test]
 fn test_forward_soa() {
-    use hickory_proto::error::ProtoErrorKind;
-    use hickory_resolver::error::ResolveErrorKind;
+    use hickory_proto::ProtoErrorKind;
+    use hickory_resolver::ResolveErrorKind;
     let resp_query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::NS);
     let soa_record = soa_record(
         Name::from_str("www.example.com").unwrap(),
@@ -499,8 +496,8 @@ fn test_forward_soa() {
 // no SOA records present (!soa.is_some())
 #[test]
 fn test_forward_ns() {
-    use hickory_proto::error::ProtoErrorKind;
-    use hickory_resolver::error::ResolveErrorKind;
+    use hickory_proto::ProtoErrorKind;
+    use hickory_resolver::ResolveErrorKind;
     let resp_query = Query::query(Name::from_str("example.com.").unwrap(), RecordType::A);
     let ns1 = ns_record(
         Default::default(),

@@ -8,6 +8,7 @@
 use std::{
     fmt::{self, Display},
     future::Future,
+    io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -18,13 +19,14 @@ use futures_util::{future::FutureExt, stream::Stream};
 use quinn::{
     crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint, TransportConfig, VarInt,
 };
-use rustls::{version::TLS13, ClientConfig as TlsClientConfig};
+use tokio::time::timeout;
 
 use crate::{
     error::ProtoError,
     quic::quic_stream::{DoqErrorCode, QuicStream},
+    rustls::client_config,
     udp::UdpSocket,
-    xfer::{DnsRequest, DnsRequestSender, DnsResponse, DnsResponseStream},
+    xfer::{DnsRequest, DnsRequestSender, DnsResponse, DnsResponseStream, CONNECT_TIMEOUT},
 };
 
 use super::{quic_config, quic_stream};
@@ -115,12 +117,12 @@ impl DnsRequestSender for QuicClientStream {
     /// a DNS message from DoQ over another transport, a DNS Message ID MUST be generated according to the rules of the protocol that is
     /// in use. When forwarding a DNS message from another transport over DoQ, the Message ID MUST be set to zero.
     /// ```
-    fn send_message(&mut self, message: DnsRequest) -> DnsResponseStream {
+    fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
         if self.is_shutdown {
             panic!("can not send messages after stream is shutdown")
         }
 
-        Box::pin(Self::inner_send(self.quic_connection.clone(), message)).into()
+        Box::pin(Self::inner_send(self.quic_connection.clone(), request)).into()
     }
 
     fn shutdown(&mut self) {
@@ -149,14 +151,14 @@ impl Stream for QuicClientStream {
 /// A QUIC connection builder for DNS-over-QUIC
 #[derive(Clone)]
 pub struct QuicClientStreamBuilder {
-    crypto_config: Option<TlsClientConfig>,
+    crypto_config: Option<rustls::ClientConfig>,
     transport_config: Arc<TransportConfig>,
     bind_addr: Option<SocketAddr>,
 }
 
 impl QuicClientStreamBuilder {
     /// Constructs a new TlsStreamBuilder with the associated ClientConfig
-    pub fn crypto_config(&mut self, crypto_config: TlsClientConfig) -> &mut Self {
+    pub fn crypto_config(&mut self, crypto_config: rustls::ClientConfig) -> &mut Self {
         self.crypto_config = Some(crypto_config);
         self
     }
@@ -172,7 +174,7 @@ impl QuicClientStreamBuilder {
     /// # Arguments
     ///
     /// * `name_server` - IP and Port for the remote DNS resolver
-    /// * `dns_name` - The DNS name, Subject Public Key Info (SPKI) name, as associated to a certificate
+    /// * `dns_name` - The DNS name associated with a certificate
     pub fn build(self, name_server: SocketAddr, dns_name: String) -> QuicClientConnect {
         QuicClientConnect(Box::pin(self.connect(name_server, dns_name)) as _)
     }
@@ -223,38 +225,26 @@ impl QuicClientStreamBuilder {
 
     async fn connect_inner(
         self,
-        mut endpoint: Endpoint,
+        endpoint: Endpoint,
         name_server: SocketAddr,
         dns_name: String,
     ) -> Result<QuicClientStream, ProtoError> {
         // ensure the ALPN protocol is set correctly
-        let mut crypto_config = if let Some(crypto_config) = self.crypto_config {
+        let crypto_config = if let Some(crypto_config) = self.crypto_config {
             crypto_config
         } else {
-            client_config_tls13()?
+            client_config().map_err(|err| ProtoError::from(err.to_string()))?
         };
-        if crypto_config.alpn_protocols.is_empty() {
-            crypto_config.alpn_protocols = vec![quic_stream::DOQ_ALPN.to_vec()];
-        }
-        let early_data_enabled = crypto_config.enable_early_data;
 
-        let mut client_config =
-            ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto_config)?));
-        client_config.transport_config(self.transport_config.clone());
-
-        endpoint.set_default_client_config(client_config);
-
-        let connecting = endpoint.connect(name_server, &dns_name)?;
-        // TODO: for Client/Dynamic update, don't use RTT, for queries, do use it.
-
-        let quic_connection = if early_data_enabled {
-            match connecting.into_0rtt() {
-                Ok((new_connection, _)) => new_connection,
-                Err(connecting) => connecting.await?,
-            }
-        } else {
-            connecting.await?
-        };
+        let quic_connection = connect_quic(
+            name_server,
+            &dns_name,
+            quic_stream::DOQ_ALPN,
+            crypto_config,
+            self.transport_config,
+            endpoint,
+        )
+        .await?;
 
         Ok(QuicClientStream {
             quic_connection,
@@ -265,42 +255,46 @@ impl QuicClientStreamBuilder {
     }
 }
 
-/// Default crypto options for quic
-pub fn client_config_tls13() -> Result<TlsClientConfig, ProtoError> {
-    use rustls::RootCertStore;
-    #[cfg_attr(
-        not(any(feature = "native-certs", feature = "webpki-roots")),
-        allow(unused_mut)
-    )]
-    let mut root_store = RootCertStore::empty();
-    #[cfg(all(feature = "native-certs", not(feature = "webpki-roots")))]
-    {
-        use crate::error::ProtoErrorKind;
-
-        let (added, ignored) =
-            root_store.add_parsable_certificates(rustls_native_certs::load_native_certs()?);
-
-        if ignored > 0 {
-            tracing::warn!(
-                "failed to parse {} certificate(s) from the native root store",
-                ignored,
-            );
-        }
-
-        if added == 0 {
-            return Err(ProtoErrorKind::NativeCerts.into());
-        }
+pub(crate) async fn connect_quic(
+    addr: SocketAddr,
+    server_name: &str,
+    protocol: &[u8],
+    mut crypto_config: rustls::ClientConfig,
+    transport_config: Arc<TransportConfig>,
+    mut endpoint: Endpoint,
+) -> Result<Connection, ProtoError> {
+    if crypto_config.alpn_protocols.is_empty() {
+        crypto_config.alpn_protocols = vec![protocol.to_vec()];
     }
-    #[cfg(feature = "webpki-roots")]
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let early_data_enabled = crypto_config.enable_early_data;
 
-    Ok(
-        TlsClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&TLS13])
-            .unwrap() // The ring default provider is guaranteed to support TLS 1.3
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
+    let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto_config)?));
+    client_config.transport_config(transport_config.clone());
+
+    endpoint.set_default_client_config(client_config);
+
+    let connecting = endpoint.connect(addr, server_name)?;
+    // TODO: for Client/Dynamic update, don't use RTT, for queries, do use it.
+
+    Ok(if early_data_enabled {
+        match connecting.into_0rtt() {
+            Ok((new_connection, _)) => new_connection,
+            Err(connecting) => connect_with_timeout(connecting).await?,
+        }
+    } else {
+        connect_with_timeout(connecting).await?
+    })
+}
+
+async fn connect_with_timeout(connecting: quinn::Connecting) -> Result<Connection, io::Error> {
+    match timeout(CONNECT_TIMEOUT, connecting).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("QUIC handshake timed out after {CONNECT_TIMEOUT:?}",),
+        )),
+    }
 }
 
 impl Default for QuicClientStreamBuilder {

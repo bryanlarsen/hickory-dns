@@ -32,10 +32,20 @@ file = "default/0.zone"
 ##  queries for "www.example.com" or "example.com" would be forwarded.
 zone = "."
 
-## zone_type: Primary, Secondary, Hint, Forward
-zone_type = "Forward"
+## zone_type: Primary, Secondary, External
+zone_type = "External"
 
 ## remember the port, defaults: 53 for Udp & Tcp, 853 for Tls and 443 for Https.
 ##   Tls and/or Https require features dns-over-tls and/or dns-over-https
-stores = { type = "forward", name_servers = [{ socket_addr = "8.8.8.8:53", protocol = "udp", trust_negative_responses = false },
-                                             { socket_addr = "8.8.8.8:53", protocol = "tcp", trust_negative_responses = false }] }
+[zones.stores]
+type = "forward"
+
+[[zones.stores.name_servers]]
+socket_addr = "8.8.8.8:53"
+protocol = "udp"
+trust_negative_responses = false
+
+[[zones.stores.name_servers]]
+socket_addr = "8.8.8.8:53"
+protocol = "tcp"
+trust_negative_responses = false

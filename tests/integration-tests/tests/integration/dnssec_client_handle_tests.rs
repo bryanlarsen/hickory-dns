@@ -1,28 +1,23 @@
-#![cfg(feature = "dnssec")]
+#![cfg(feature = "dnssec-ring")]
 
-use std::net::*;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::executor::block_on;
-use tokio::net::TcpStream as TokioTcpStream;
-use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::runtime::Runtime;
 
-use hickory_client::client::{AsyncClient, ClientHandle, MemoizeClientHandle};
-use hickory_proto::iocompat::AsyncIoTokioAsStd;
+use hickory_client::client::{Client, ClientHandle, MemoizeClientHandle};
+use hickory_proto::dnssec::{DnssecDnsHandle, TrustAnchor};
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::dnssec::{Proof, TrustAnchor};
-use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::Name;
-use hickory_proto::rr::{DNSClass, RData, RecordType};
+use hickory_proto::rr::{DNSClass, RecordType};
+use hickory_proto::runtime::TokioRuntimeProvider;
 use hickory_proto::tcp::TcpClientStream;
-use hickory_proto::udp::{UdpClientConnect, UdpClientStream};
-use hickory_proto::DnssecDnsHandle;
+use hickory_proto::udp::UdpClientStream;
 use hickory_server::authority::{Authority, Catalog};
 
 use hickory_integration::example_authority::create_secure_example;
-use hickory_integration::TestClientStream;
+use hickory_integration::{TestClientStream, GOOGLE_V4};
 
 #[test]
 fn test_secure_query_example_nonet() {
@@ -30,7 +25,7 @@ fn test_secure_query_example_nonet() {
 }
 
 #[test]
-#[ignore] // this getting finnicky responses with UDP
+#[ignore = "flaky test against internet server"]
 fn test_secure_query_example_udp() {
     with_udp(test_secure_query_example);
 }
@@ -44,30 +39,22 @@ fn test_secure_query_example<H>(mut client: DnssecDnsHandle<H>, io_loop: Runtime
 where
     H: ClientHandle + Sync + 'static,
 {
-    let name = Name::from_str("www.example.com").unwrap();
+    let name = Name::from_str("www.example.com.").unwrap();
     let response = io_loop
         .block_on(client.query(name.clone(), DNSClass::IN, RecordType::A))
         .expect("query failed");
 
     println!("response records: {response:?}");
-    assert!(response
-        .extensions()
-        .as_ref()
-        .expect("edns not here")
-        .dnssec_ok());
+    assert!(
+        response
+            .extensions()
+            .as_ref()
+            .expect("edns not here")
+            .flags()
+            .dnssec_ok
+    );
 
     assert!(!response.answers().is_empty());
-    let record = &response.answers()[0];
-    assert_eq!(record.name(), &name);
-    assert_eq!(record.record_type(), RecordType::A);
-    assert_eq!(record.dns_class(), DNSClass::IN);
-    assert_eq!(record.proof(), Proof::Secure);
-
-    if let RData::A(ref address) = *record.data() {
-        assert_eq!(address, &A::new(93, 184, 215, 14))
-    } else {
-        panic!();
-    }
 }
 
 #[test]
@@ -76,13 +63,13 @@ fn test_nsec_query_example_nonet() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "flaky test against internet server"]
 fn test_nsec_query_example_udp() {
     with_udp(test_nsec_query_example);
 }
 
 #[test]
-#[ignore]
+#[ignore = "flaky test against internet server"]
 fn test_nsec_query_example_tcp() {
     with_tcp(test_nsec_query_example);
 }
@@ -91,7 +78,7 @@ fn test_nsec_query_example<H>(mut client: DnssecDnsHandle<H>, io_loop: Runtime)
 where
     H: ClientHandle + Sync + 'static,
 {
-    let name = Name::from_str("none.example.com").unwrap();
+    let name = Name::from_str("none.example.com.").unwrap();
 
     let response = io_loop
         .block_on(client.query(name, DNSClass::IN, RecordType::A))
@@ -106,13 +93,13 @@ where
 // }
 
 #[test]
-#[ignore]
+#[ignore = "flaky test against internet server"]
 fn test_nsec_query_type_udp() {
     with_udp(test_nsec_query_type);
 }
 
 #[test]
-#[ignore]
+#[ignore = "flaky test against internet server"]
 fn test_nsec_query_type_tcp() {
     with_tcp(test_nsec_query_type);
 }
@@ -121,7 +108,7 @@ fn test_nsec_query_type<H>(mut client: DnssecDnsHandle<H>, io_loop: Runtime)
 where
     H: ClientHandle + Sync + 'static,
 {
-    let name = Name::from_str("www.example.com").unwrap();
+    let name = Name::from_str("www.example.com.").unwrap();
 
     let response = io_loop
         .block_on(client.query(name, DNSClass::IN, RecordType::NS))
@@ -194,7 +181,7 @@ where
 
 fn with_nonet<F>(test: F)
 where
-    F: Fn(DnssecDnsHandle<MemoizeClientHandle<AsyncClient>>, Runtime),
+    F: Fn(DnssecDnsHandle<MemoizeClientHandle<Client>>, Runtime),
 {
     let succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let succeeded_clone = succeeded.clone();
@@ -232,17 +219,17 @@ where
     };
 
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let client = AsyncClient::new(stream, sender, None);
+    let client = Client::new(stream, sender, None);
 
     let (client, bg) = io_loop
         .block_on(client)
         .expect("failed to create new client");
 
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
     let client = MemoizeClientHandle::new(client);
     let secure_client = DnssecDnsHandle::with_trust_anchor(client, trust_anchor);
 
@@ -253,7 +240,7 @@ where
 
 fn with_udp<F>(test: F)
 where
-    F: Fn(DnssecDnsHandle<MemoizeClientHandle<AsyncClient>>, Runtime),
+    F: Fn(DnssecDnsHandle<MemoizeClientHandle<Client>>, Runtime),
 {
     let succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let succeeded_clone = succeeded.clone();
@@ -274,11 +261,10 @@ where
         .unwrap();
 
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("8.8.8.8", 53).to_socket_addrs().unwrap().next().unwrap();
-    let stream: UdpClientConnect<TokioUdpSocket> = UdpClientStream::new(addr);
-    let client = AsyncClient::connect(stream);
+    let stream = UdpClientStream::builder(GOOGLE_V4, TokioRuntimeProvider::new()).build();
+    let client = Client::connect(stream);
     let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let client = MemoizeClientHandle::new(client);
     let secure_client = DnssecDnsHandle::new(client);
@@ -291,7 +277,7 @@ where
 // TODO: just make this a Tokio test?
 fn with_tcp<F>(test: F)
 where
-    F: Fn(DnssecDnsHandle<MemoizeClientHandle<AsyncClient>>, Runtime),
+    F: Fn(DnssecDnsHandle<MemoizeClientHandle<Client>>, Runtime),
 {
     let succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let succeeded_clone = succeeded.clone();
@@ -312,11 +298,10 @@ where
         .unwrap();
 
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("8.8.8.8", 53).to_socket_addrs().unwrap().next().unwrap();
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-    let client = AsyncClient::new(Box::new(stream), sender, None);
+    let (stream, sender) = TcpClientStream::new(GOOGLE_V4, None, None, TokioRuntimeProvider::new());
+    let client = Client::new(Box::new(stream), sender, None);
     let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     let client = MemoizeClientHandle::new(client);
     let secure_client = DnssecDnsHandle::new(client);

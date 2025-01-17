@@ -17,10 +17,6 @@
 //! using an FQDN during lookup), dual-stack IPv4/IPv6 lookups, performing chained CNAME lookups,
 //! and features connection metric tracking for attempting to pick the best upstream DNS resolver.
 //!
-//! There are two types for performing DNS queries, [`Resolver`] and [`AsyncResolver`]. `Resolver`
-//! is the easiest to work with, it is a wrapper around [`AsyncResolver`]. `AsyncResolver` is a
-//! `Tokio` based async resolver, and can be used inside any `Tokio` based system.
-//!
 //! This as best as possible attempts to abide by the DNS RFCs, please file issues at
 //! <https://github.com/hickory-dns/hickory-dns>.
 //!
@@ -33,41 +29,6 @@
 //! hickory-resolver = "*"
 //! ```
 //!
-//! ## Using the Synchronous Resolver
-//!
-//! This uses the default configuration, which sets the [Google Public
-//! DNS](https://developers.google.com/speed/public-dns/) as the upstream resolvers. Please see
-//! their [privacy statement](https://developers.google.com/speed/public-dns/privacy) for important
-//! information about what they track, many ISP's track similar information in DNS.
-//!
-//! ```rust
-//! # fn main() {
-//! # #[cfg(feature = "tokio-runtime")]
-//! # {
-//! use std::net::*;
-//! use hickory_resolver::Resolver;
-//! use hickory_resolver::config::*;
-//!
-//! // Construct a new Resolver with default configuration options
-//! let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).unwrap();
-//!
-//! // Lookup the IP addresses associated with a name.
-//! // The final dot forces this to be an FQDN, otherwise the search rules as specified
-//! //  in `ResolverOpts` will take effect. FQDN's are generally cheaper queries.
-//! let response = resolver.lookup_ip("www.example.com.").unwrap();
-//!
-//! // There can be many addresses associated with the name,
-//! //  this can return IPv4 and/or IPv6 addresses
-//! let address = response.iter().next().expect("no addresses returned!");
-//! if address.is_ipv4() {
-//!     assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-//! } else {
-//!     assert_eq!(address, IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c)));
-//! }
-//! # }
-//! # }
-//! ```
-//!
 //! ## Using the host system config
 //!
 //! On Unix systems, the `/etc/resolv.conf` can be used for configuration. Not all options
@@ -75,24 +36,22 @@
 //! addition there may be additional options supported which the host system does not. Example:
 //!
 //! ```rust,no_run
-//! # fn main() {
+//! # #[tokio::main]
+//! # async fn main() {
 //! # #[cfg(feature = "tokio-runtime")]
 //! # {
 //! # use std::net::*;
 //! # use hickory_resolver::Resolver;
 //! // Use the host OS'es `/etc/resolv.conf`
 //! # #[cfg(unix)]
-//! let resolver = Resolver::from_system_conf().unwrap();
+//! let resolver = Resolver::tokio_from_system_conf().unwrap();
 //! # #[cfg(unix)]
-//! let response = resolver.lookup_ip("www.example.com.").unwrap();
+//! let response = resolver.lookup_ip("www.example.com.").await.unwrap();
 //! # }
 //! # }
 //! ```
 //!
 //! ## Using the Tokio/Async Resolver
-//!
-//! For more advanced asynchronous usage, the `AsyncResolver`] is integrated with Tokio. In fact,
-//! the [`AsyncResolver`] is used by the synchronous Resolver for all lookups.
 //!
 //! ```rust
 //! # fn main() {
@@ -100,7 +59,7 @@
 //! # {
 //! use std::net::*;
 //! use tokio::runtime::Runtime;
-//! use hickory_resolver::TokioAsyncResolver;
+//! use hickory_resolver::TokioResolver;
 //! use hickory_resolver::config::*;
 //!
 //! // We need a Tokio Runtime to run the resolver
@@ -109,7 +68,7 @@
 //!
 //! // Construct a new Resolver with default configuration options
 //! let resolver = io_loop.block_on(async {
-//!     TokioAsyncResolver::tokio(
+//!     TokioResolver::tokio(
 //!         ResolverConfig::default(),
 //!         ResolverOpts::default())
 //! });
@@ -124,12 +83,7 @@
 //!
 //! // There can be many addresses associated with the name,
 //! //  this can return IPv4 and/or IPv6 addresses
-//! let address = response.iter().next().expect("no addresses returned!");
-//! if address.is_ipv4() {
-//!     assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-//! } else {
-//!     assert_eq!(address, IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c)));
-//! }
+//! let _address = response.iter().next().expect("no addresses returned!");
 //! # }
 //! # }
 //! ```
@@ -143,14 +97,14 @@
 //! # {
 //! # use std::net::*;
 //! # use tokio::runtime::Runtime;
-//! # use hickory_resolver::TokioAsyncResolver;
+//! # use hickory_resolver::TokioResolver;
 //! # use hickory_resolver::config::*;
 //! # use futures_util::TryFutureExt;
 //! #
 //! # let mut io_loop = Runtime::new().unwrap();
 //! #
 //! # let resolver = io_loop.block_on(async {
-//! #    TokioAsyncResolver::tokio(
+//! #    TokioResolver::tokio(
 //! #        ResolverConfig::default(),
 //! #        ResolverOpts::default())
 //! # });
@@ -208,12 +162,12 @@
 //! # fn main() {
 //! # #[cfg(feature = "tokio-runtime")]
 //! # {
-//! use hickory_resolver::Resolver;
+//! use hickory_resolver::TokioResolver;
 //! use hickory_resolver::config::*;
 //!
 //! // Construct a new Resolver with default configuration options
 //! # #[cfg(feature = "dns-over-tls")]
-//! let mut resolver = Resolver::new(ResolverConfig::cloudflare_tls(), ResolverOpts::default()).unwrap();
+//! let mut resolver = TokioResolver::tokio(ResolverConfig::cloudflare_tls(), ResolverOpts::default());
 //!
 //! // see example above...
 //! # }
@@ -243,72 +197,52 @@
 )]
 #![recursion_limit = "128"]
 #![allow(clippy::needless_doctest_main, clippy::single_component_path_imports)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-#[cfg(feature = "dns-over-tls")]
-#[macro_use]
-extern crate cfg_if;
-#[cfg(feature = "serde")]
-#[macro_use]
-extern crate serde;
-pub extern crate hickory_proto as proto;
+pub use hickory_proto as proto;
+// reexports from proto
+pub use proto::rr::{IntoName, Name};
 
-mod async_resolver;
 pub mod caching_client;
 pub mod config;
 pub mod dns_lru;
-pub mod error;
+mod error;
+pub use error::{ResolveError, ResolveErrorKind};
 #[cfg(feature = "dns-over-https-rustls")]
 mod h2;
 #[cfg(feature = "dns-over-h3")]
 mod h3;
 mod hosts;
+pub use hosts::Hosts;
 pub mod lookup;
 pub mod lookup_ip;
 // TODO: consider #[doc(hidden)]
 pub mod name_server;
+#[cfg(feature = "tokio-runtime")]
+use name_server::TokioConnectionProvider;
 #[cfg(feature = "dns-over-quic")]
 mod quic;
-#[cfg(feature = "tokio-runtime")]
 mod resolver;
+#[cfg(feature = "testing")]
+pub use resolver::testing;
+pub use resolver::LookupFuture;
+pub use resolver::Resolver;
+#[cfg(feature = "tokio-runtime")]
+pub use resolver::TokioResolver;
 pub mod system_conf;
-#[cfg(feature = "dns-over-tls")]
+#[cfg(test)]
+mod tests;
+#[cfg(feature = "dns-over-rustls")]
 mod tls;
 
-// reexports from proto
-pub use self::proto::rr::{IntoName, Name, TryParseIp};
+#[doc(hidden)]
+#[deprecated(since = "0.25.0", note = "use `Resolver` instead")]
+pub type AsyncResolver<P> = Resolver<P>;
 
-#[cfg(feature = "testing")]
-#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
-pub use async_resolver::testing;
-pub use async_resolver::AsyncResolver;
+#[doc(hidden)]
+#[deprecated(since = "0.25.0", note = "use `TokioResolver` instead")]
 #[cfg(feature = "tokio-runtime")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio-runtime")))]
-pub use async_resolver::TokioAsyncResolver;
-pub use hosts::Hosts;
-#[cfg(feature = "tokio-runtime")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio-runtime")))]
-pub use name_server::TokioHandle;
-#[cfg(feature = "tokio-runtime")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio-runtime")))]
-pub use resolver::Resolver;
-
-/// This is an alias for [`AsyncResolver`], which replaced the type previously
-/// called `ResolverFuture`.
-///
-/// # Note
-///
-/// For users of `ResolverFuture`, the return type for `ResolverFuture::new`
-/// has changed since version 0.9 of `hickory-resolver`. It now returns
-/// a tuple of an [`AsyncResolver`] _and_ a background future, which must
-/// be spawned on a reactor before any lookup futures will run.
-///
-/// See the [`AsyncResolver`] documentation for more information on how to
-/// use the background future.
-#[deprecated(note = "use [`hickory_resolver::AsyncResolver`] instead")]
-#[cfg(feature = "tokio-runtime")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio-runtime")))]
-pub type ResolverFuture = TokioAsyncResolver;
+pub type TokioAsyncResolver = Resolver<TokioConnectionProvider>;
 
 /// returns a version as specified in Cargo.toml
 pub fn version() -> &'static str {

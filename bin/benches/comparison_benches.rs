@@ -7,29 +7,25 @@ use std::env;
 use std::fs::{DirBuilder, File};
 use std::future::Future;
 use std::mem;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use hickory_proto::runtime::TokioRuntimeProvider;
 use test::Bencher;
-use tokio::net::TcpStream;
-use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 
-use hickory_client::client::{AsyncClient, ClientHandle};
-use hickory_proto::error::ProtoError;
-use hickory_proto::iocompat::AsyncIoTokioAsStd;
-use hickory_proto::op::NoopMessageFinalizer;
+use hickory_client::client::{Client, ClientHandle};
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_proto::tcp::TcpClientStream;
 use hickory_proto::udp::UdpClientStream;
 use hickory_proto::xfer::{DnsMultiplexer, DnsRequestSender};
+use hickory_proto::ProtoError;
 
 fn find_test_port() -> u16 {
     let server = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
@@ -50,16 +46,13 @@ impl Drop for NamedProcess {
 
 fn wrap_process(named: Child, server_port: u16) -> NamedProcess {
     let mut started = false;
+    let provider = TokioRuntimeProvider::new();
 
     for _ in 0..20 {
         let io_loop = Runtime::new().unwrap();
-        let addr: SocketAddr = ("127.0.0.1", server_port)
-            .to_socket_addrs()
-            .unwrap()
-            .next()
-            .unwrap();
-        let stream = UdpClientStream::<UdpSocket>::new(addr);
-        let client = AsyncClient::connect(stream);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+        let stream = UdpClientStream::builder(addr, provider.clone()).build();
+        let client = Client::connect(stream);
         let (mut client, bg) = io_loop.block_on(client).expect("failed to create client");
         io_loop.spawn(bg);
 
@@ -118,7 +111,7 @@ where
     S: DnsRequestSender,
 {
     let io_loop = Runtime::new().unwrap();
-    let client = AsyncClient::connect(stream);
+    let client = Client::connect(stream);
     let (mut client, bg) = io_loop.block_on(client).expect("failed to create client");
     io_loop.spawn(bg);
 
@@ -131,8 +124,8 @@ where
     assert_eq!(response.response_code(), ResponseCode::NoError);
 
     let record = &response.answers()[0];
-    if let RData::A(ref address) = record.data() {
-        assert_eq!(address, &A(Ipv4Addr::new(127, 0, 0, 1)));
+    if let RData::A(address) = record.data() {
+        assert_eq!(address, &A(Ipv4Addr::LOCALHOST));
     } else {
         unreachable!();
     }
@@ -147,12 +140,8 @@ where
 fn hickory_udp_bench(b: &mut Bencher) {
     let (named, server_port) = hickory_process();
 
-    let addr: SocketAddr = ("127.0.0.1", server_port)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let stream = UdpClientStream::<UdpSocket>::new(addr);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let stream = UdpClientStream::builder(addr, TokioRuntimeProvider::new()).build();
     bench(b, stream);
 
     // cleaning up the named process
@@ -164,12 +153,8 @@ fn hickory_udp_bench(b: &mut Bencher) {
 fn hickory_udp_bench_prof(b: &mut Bencher) {
     let server_port = 6363;
 
-    let addr: SocketAddr = ("127.0.0.1", server_port)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let stream = UdpClientStream::<UdpSocket>::new(addr);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let stream = UdpClientStream::builder(addr, TokioRuntimeProvider::new()).build();
     bench(b, stream);
 }
 
@@ -177,13 +162,9 @@ fn hickory_udp_bench_prof(b: &mut Bencher) {
 fn hickory_tcp_bench(b: &mut Bencher) {
     let (named, server_port) = hickory_process();
 
-    let addr: SocketAddr = ("127.0.0.1", server_port)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TcpStream>>::new(addr);
-    let mp = DnsMultiplexer::new(stream, sender, None::<Arc<NoopMessageFinalizer>>);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let (stream, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::new());
+    let mp = DnsMultiplexer::new(stream, sender, None);
     bench(b, mp);
 
     // cleaning up the named process
@@ -235,12 +216,8 @@ fn bind_process() -> (NamedProcess, u16) {
 fn bind_udp_bench(b: &mut Bencher) {
     let (named, server_port) = bind_process();
 
-    let addr: SocketAddr = ("127.0.0.1", server_port)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let stream = UdpClientStream::<UdpSocket>::new(addr);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let stream = UdpClientStream::builder(addr, TokioRuntimeProvider::new()).build();
     bench(b, stream);
 
     // cleaning up the named process
@@ -252,13 +229,9 @@ fn bind_udp_bench(b: &mut Bencher) {
 fn bind_tcp_bench(b: &mut Bencher) {
     let (named, server_port) = bind_process();
 
-    let addr: SocketAddr = ("127.0.0.1", server_port)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TcpStream>>::new(addr);
-    let mp = DnsMultiplexer::new(stream, sender, None::<Arc<NoopMessageFinalizer>>);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let (stream, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::new());
+    let mp = DnsMultiplexer::new(stream, sender, None);
     bench(b, mp);
 
     // cleaning up the named process

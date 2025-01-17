@@ -5,6 +5,7 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use std::future::{ready, Future};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -12,19 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::stream::{once, Stream};
-use futures::{future, AsyncRead, AsyncWrite, Future};
+use futures::{future, AsyncRead, AsyncWrite};
 
-use hickory_proto::error::ProtoError;
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::rdata::{CNAME, NS, SOA};
 use hickory_proto::rr::{Name, RData, Record};
+use hickory_proto::runtime::TokioTime;
+use hickory_proto::runtime::{RuntimeProvider, TokioHandle};
 use hickory_proto::tcp::DnsTcpStream;
 use hickory_proto::udp::DnsUdpSocket;
 use hickory_proto::xfer::{DnsHandle, DnsRequest, DnsResponse};
-use hickory_proto::TokioTime;
+use hickory_proto::ProtoError;
 use hickory_resolver::config::{NameServerConfig, ResolverOpts};
-use hickory_resolver::name_server::{ConnectionProvider, RuntimeProvider};
-use hickory_resolver::TokioHandle;
+use hickory_resolver::name_server::ConnectionProvider;
 
 pub struct TcpPlaceholder;
 
@@ -103,6 +104,8 @@ impl RuntimeProvider for MockRuntimeProvider {
     fn connect_tcp(
         &self,
         _server_addr: SocketAddr,
+        _bind_addr: Option<SocketAddr>,
+        _wait_for: Option<std::time::Duration>,
     ) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Tcp>>>> {
         Box::pin(async { Ok(TcpPlaceholder) })
     }
@@ -234,7 +237,7 @@ pub trait OnSend: Clone + Send + Sync + 'static {
     where
         E: From<ProtoError> + Send + 'static,
     {
-        Box::pin(future::ready(response))
+        Box::pin(ready(response))
     }
 }
 

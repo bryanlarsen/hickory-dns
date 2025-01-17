@@ -11,13 +11,13 @@ use crate::{
         Queries,
     },
     proto::{
-        error::*,
         op::{
             message::{self, EmitAndCount},
             Edns, Header, ResponseCode,
         },
         rr::Record,
         serialize::binary::BinEncoder,
+        ProtoError,
     },
     server::ResponseInfo,
 };
@@ -64,8 +64,8 @@ impl<'q> From<Option<&'q WireQuery>> for EmptyOrQueries<'q> {
     }
 }
 
-impl<'q> EmitAndCount for EmptyOrQueries<'q> {
-    fn emit(&mut self, encoder: &mut BinEncoder<'_>) -> ProtoResult<usize> {
+impl EmitAndCount for EmptyOrQueries<'_> {
+    fn emit(&mut self, encoder: &mut BinEncoder<'_>) -> Result<usize, ProtoError> {
         match self {
             EmptyOrQueries::Empty => Ok(0),
             EmptyOrQueries::Queries(q) => q.emit(encoder),
@@ -73,7 +73,7 @@ impl<'q> EmitAndCount for EmptyOrQueries<'q> {
     }
 }
 
-impl<'q, 'a, A, N, S, D> MessageResponse<'q, 'a, A, N, S, D>
+impl<'a, A, N, S, D> MessageResponse<'_, 'a, A, N, S, D>
 where
     A: Iterator<Item = &'a Record> + Send + 'a,
     N: Iterator<Item = &'a Record> + Send + 'a,
@@ -102,7 +102,10 @@ where
     }
 
     /// Consumes self, and emits to the encoder.
-    pub fn destructive_emit(mut self, encoder: &mut BinEncoder<'_>) -> ProtoResult<ResponseInfo> {
+    pub fn destructive_emit(
+        mut self,
+        encoder: &mut BinEncoder<'_>,
+    ) -> Result<ResponseInfo, ProtoError> {
         // soa records are part of the nameserver section
         let mut name_servers = self.name_servers.chain(self.soa);
 

@@ -3,12 +3,8 @@ use std::str::FromStr;
 use hickory_proto::rr::*;
 
 use hickory_server::authority::ZoneType;
-#[cfg(any(
-    feature = "dnssec",
-    feature = "dns-over-rustls",
-    feature = "dns-over-openssl"
-))]
-use hickory_server::config::dnssec::NxProofKind;
+#[cfg(feature = "dnssec")]
+use hickory_server::dnssec::NxProofKind;
 use hickory_server::store::in_memory::InMemoryAuthority;
 
 #[allow(unused)]
@@ -22,11 +18,7 @@ pub fn create_example() -> InMemoryAuthority {
         origin.clone(),
         ZoneType::Primary,
         false,
-        #[cfg(any(
-            feature = "dnssec",
-            feature = "dns-over-rustls",
-            feature = "dns-over-openssl"
-        ))]
+        #[cfg(feature = "dnssec")]
         Some(NxProofKind::Nsec),
     );
 
@@ -193,21 +185,25 @@ pub fn create_example() -> InMemoryAuthority {
     records
 }
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 #[allow(unused)]
 pub fn create_secure_example() -> InMemoryAuthority {
-    use hickory_proto::rr::dnssec::*;
+    use hickory_proto::dnssec::{
+        rdata::DNSKEY, ring::RsaSigningKey, Algorithm, PublicKey, SigSigner, SigningKey,
+    };
     use hickory_server::authority::{Authority, DnssecAuthority};
-    use openssl::rsa::Rsa;
+    use rustls_pki_types::PrivatePkcs8KeyDer;
     use time::Duration;
 
     let mut authority = create_example();
-    let rsa = Rsa::generate(2_048).unwrap();
-    let key = KeyPair::from_rsa(rsa).unwrap();
-    let dnskey = key.to_dnskey(Algorithm::RSASHA256).unwrap();
+
+    const KEY: &[u8] = include_bytes!("../tests/rsa-2048.pk8");
+    let key =
+        RsaSigningKey::from_pkcs8(&PrivatePkcs8KeyDer::from(KEY), Algorithm::RSASHA256).unwrap();
+    let dnskey = key.to_public_key().unwrap();
     let signer = SigSigner::dnssec(
-        dnskey,
-        key,
+        DNSKEY::from_key(&key.to_public_key().unwrap()),
+        Box::new(key),
         authority.origin().clone().into(),
         Duration::weeks(1).try_into().unwrap(),
     );

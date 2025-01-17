@@ -192,7 +192,7 @@ impl Name {
     ///
     /// // From strings, uses utf8 conversion
     /// let from_labels = Name::from_labels(vec!["www", "example", "com"]).unwrap();
-    /// assert_eq!(from_labels, Name::from_str("www.example.com").unwrap());
+    /// assert_eq!(from_labels, Name::from_str("www.example.com.").unwrap());
     ///
     /// // Force a set of bytes into labels (this is none-standard and potentially dangerous)
     /// let from_labels = Name::from_labels(vec!["bad chars".as_bytes(), "example".as_bytes(), "com".as_bytes()]).unwrap();
@@ -279,7 +279,7 @@ impl Name {
     /// let local = Name::from_str("www").unwrap();
     /// let domain = Name::from_str("example.com").unwrap();
     /// let name = local.append_domain(&domain).unwrap();
-    /// assert_eq!(name, Name::from_str("www.example.com").unwrap());
+    /// assert_eq!(name, Name::from_str("www.example.com.").unwrap());
     /// assert!(name.is_fqdn())
     /// ```
     pub fn append_domain(self, domain: &Self) -> Result<Self, ProtoError> {
@@ -395,7 +395,6 @@ impl Name {
     /// use std::str::FromStr;
     /// use hickory_proto::rr::domain::Name;
     ///
-    /// let name = Name::from_str("www.example.com").unwrap();
     /// let name = Name::from_str("www.example.com").unwrap();
     /// let zone = Name::from_str("example.com").unwrap();
     /// let another = Name::from_str("example.net").unwrap();
@@ -728,6 +727,15 @@ impl Name {
 
     /// compares with the other label, ignoring case
     fn cmp_with_f<F: LabelCmp>(&self, other: &Self) -> Ordering {
+        match (self.is_fqdn(), other.is_fqdn()) {
+            (false, true) => Ordering::Less,
+            (true, false) => Ordering::Greater,
+            _ => self.cmp_labels::<F>(other),
+        }
+    }
+
+    /// Compare two Names, not considering FQDN-ness.
+    fn cmp_labels<F: LabelCmp>(&self, other: &Self) -> Ordering {
         if self.label_ends.is_empty() && other.label_ends.is_empty() {
             return Ordering::Equal;
         }
@@ -756,6 +764,68 @@ impl Name {
     /// Compares the Names, in a case sensitive manner
     pub fn eq_case(&self, other: &Self) -> bool {
         self.cmp_with_f::<CaseSensitive>(other) == Ordering::Equal
+    }
+
+    /// Non-FQDN-aware case-insensitive comparison
+    ///
+    /// This will return true if names are equal, or if an otherwise equal relative and
+    /// non-relative name are compared.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    /// use hickory_proto::rr::domain::Name;
+    ///
+    /// let name1 = Name::from_str("a.com.").unwrap();
+    /// let name2 = name1.clone();
+    /// assert_eq!(&name1, &name2);
+    /// assert!(name1.eq_ignore_root(&name2));
+    ///
+    /// // Make name2 uppercase.
+    /// let name2 = Name::from_str("A.CoM.").unwrap();
+    /// assert_eq!(&name1, &name2);
+    /// assert!(name1.eq_ignore_root(&name2));
+    ///
+    /// // Make name2 a relative name.
+    /// // Note that standard equality testing now returns false.
+    /// let name2 = Name::from_str("a.com").unwrap();
+    /// assert!(&name1 != &name2);
+    /// assert!(name1.eq_ignore_root(&name2));
+    ///
+    /// // Make name2 a completely unrelated name.
+    /// let name2 = Name::from_str("b.com.").unwrap();
+    /// assert!(&name1 != &name2);
+    /// assert!(!name1.eq_ignore_root(&name2));
+    ///
+    /// ```
+    pub fn eq_ignore_root(&self, other: &Self) -> bool {
+        self.cmp_labels::<CaseInsensitive>(other) == Ordering::Equal
+    }
+
+    /// Non-FQDN-aware case-sensitive comparison
+    ///
+    /// This will return true if names are equal, or if an otherwise equal relative and
+    /// non-relative name are compared.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    /// use hickory_proto::rr::domain::Name;
+    ///
+    /// let name1 = Name::from_str("a.com.").unwrap();
+    /// let name2 = Name::from_ascii("A.CoM.").unwrap();
+    /// let name3 = Name::from_ascii("A.CoM").unwrap();
+    ///
+    /// assert_eq!(&name1, &name2);
+    /// assert!(name1.eq_ignore_root(&name2));
+    /// assert!(!name1.eq_ignore_root_case(&name2));
+    /// assert!(name2.eq_ignore_root_case(&name3));
+    ///
+    /// ```
+    pub fn eq_ignore_root_case(&self, other: &Self) -> bool {
+        self.cmp_labels::<CaseSensitive>(other) == Ordering::Equal
     }
 
     /// Converts this name into an ascii safe string.
@@ -895,7 +965,7 @@ impl Name {
     /// assert!(!name.is_wildcard());
     /// ```
     pub fn is_wildcard(&self) -> bool {
-        self.iter().next().map_or(false, |l| l == b"*")
+        self.iter().next().is_some_and(|l| l == b"*")
     }
 
     /// Converts a name to a wildcard, by replacing the first label with `*`
@@ -906,7 +976,7 @@ impl Name {
     /// use std::str::FromStr;
     /// use hickory_proto::rr::Name;
     ///
-    /// let name = Name::from_str("www.example.com").unwrap().into_wildcard();
+    /// let name = Name::from_str("www.example.com.").unwrap().into_wildcard();
     /// assert_eq!(name, Name::from_str("*.example.com.").unwrap());
     ///
     /// // does nothing if the root
@@ -950,6 +1020,7 @@ trait LabelEnc {
 }
 
 struct LabelEncAscii;
+
 impl LabelEnc for LabelEncAscii {
     #[allow(clippy::wrong_self_convention)]
     fn to_label(name: &str) -> ProtoResult<Label> {
@@ -962,6 +1033,7 @@ impl LabelEnc for LabelEncAscii {
 }
 
 struct LabelEncUtf8;
+
 impl LabelEnc for LabelEncUtf8 {
     #[allow(clippy::wrong_self_convention)]
     fn to_label(name: &str) -> ProtoResult<Label> {
@@ -1003,9 +1075,9 @@ impl<'a> Iterator for LabelIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for LabelIter<'a> {}
+impl ExactSizeIterator for LabelIter<'_> {}
 
-impl<'a> DoubleEndedIterator for LabelIter<'a> {
+impl DoubleEndedIterator for LabelIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.end <= self.start {
             return None;
@@ -1114,7 +1186,10 @@ impl From<Ipv6Addr> for Name {
 
 impl PartialEq<Self> for Name {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp_with_f::<CaseInsensitive>(other) == Ordering::Equal
+        match self.is_fqdn == other.is_fqdn {
+            true => self.cmp_with_f::<CaseInsensitive>(other) == Ordering::Equal,
+            false => false,
+        }
     }
 }
 
@@ -1152,8 +1227,7 @@ impl<'r> BinDecodable<'r> for Name {
     ///  all names will be stored lowercase internally.
     /// This will consume the portions of the `Vec` which it is reading...
     fn read(decoder: &mut BinDecoder<'r>) -> ProtoResult<Self> {
-        let mut name = Self::root(); // this is FQDN
-
+        let mut name = Self::default();
         read_inner(decoder, &mut name, None)?;
         Ok(name)
     }
@@ -1167,7 +1241,7 @@ fn read_inner(
     let mut state: LabelParseState = LabelParseState::LabelLengthOrPointer;
     let name_start = decoder.index();
 
-    // assume all chars are utf-8. We're doing byte-by-byte operations, no endianess issues...
+    // assume all chars are utf-8. We're doing byte-by-byte operations, no endianness issues...
     // reserved: (1000 0000 aka 0800) && (0100 0000 aka 0400)
     // pointer: (slice == 1100 0000 aka C0) & C0 == true, then 03FF & slice = offset
     // label: 03FF & slice = length; slice.next(length) = label
@@ -1190,7 +1264,24 @@ fn read_inner(
                     .peek()
                     .map(Restrict::unverified /*verified in this usage*/)
                 {
-                    Some(0) | None => LabelParseState::Root,
+                    Some(0) => {
+                        // RFC 1035 Section 3.1 - Name space definitions
+                        //
+                        // Domain names in messages are expressed in terms of a sequence of labels.
+                        // Each label is represented as a one octet length field followed by that
+                        // number of octets.  **Since every domain name ends with the null label of
+                        // the root, a domain name is terminated by a length byte of zero.**  The
+                        // high order two bits of every length octet must be zero, and the
+                        // remaining six bits of the length field limit the label to 63 octets or
+                        // less.
+                        name.set_fqdn(true);
+                        LabelParseState::Root
+                    }
+                    None => {
+                        // Valid names on the wire should end in a 0-octet, signifying the end of
+                        // the name. If the last byte wasn't 00, the name is invalid.
+                        return Err(DecodeError::InsufficientBytes);
+                    }
                     Some(byte) if byte & 0b1100_0000 == 0b1100_0000 => LabelParseState::Pointer,
                     Some(byte) if byte & 0b1100_0000 == 0b0000_0000 => LabelParseState::Label,
                     Some(byte) => return Err(DecodeError::UnrecognizedLabelCode(byte)),
@@ -1328,7 +1419,7 @@ enum LabelParseState {
     LabelLengthOrPointer, // basically the start of the FSM
     Label,                // storing length of the label, must be < 63
     Pointer,              // location of pointer in slice,
-    Root,                 // root is the end of the labels list, aka null
+    Root,                 // root is the end of the labels list for an FQDN
 }
 
 impl FromStr for Name {
@@ -1344,12 +1435,19 @@ impl FromStr for Name {
 pub trait IntoName: Sized {
     /// Convert this into Name
     fn into_name(self) -> ProtoResult<Name>;
+
+    /// Check if this value is a valid IP address
+    fn to_ip(&self) -> Option<IpAddr>;
 }
 
-impl<'a> IntoName for &'a str {
+impl IntoName for &str {
     /// Performs a utf8, IDNA or punycode, translation of the `str` into `Name`
     fn into_name(self) -> ProtoResult<Name> {
         Name::from_utf8(self)
+    }
+
+    fn to_ip(&self) -> Option<IpAddr> {
+        IpAddr::from_str(self).ok()
     }
 }
 
@@ -1358,12 +1456,20 @@ impl IntoName for String {
     fn into_name(self) -> ProtoResult<Name> {
         Name::from_utf8(self)
     }
+
+    fn to_ip(&self) -> Option<IpAddr> {
+        IpAddr::from_str(self).ok()
+    }
 }
 
 impl IntoName for &String {
     /// Performs a utf8, IDNA or punycode, translation of the `&String` into `Name`
     fn into_name(self) -> ProtoResult<Name> {
         Name::from_utf8(self)
+    }
+
+    fn to_ip(&self) -> Option<IpAddr> {
+        IpAddr::from_str(self).ok()
     }
 }
 
@@ -1373,6 +1479,10 @@ where
 {
     fn into_name(self) -> ProtoResult<Name> {
         Ok(self.into())
+    }
+
+    fn to_ip(&self) -> Option<IpAddr> {
+        None
     }
 }
 
@@ -1402,6 +1512,7 @@ mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
     use std::cmp::Ordering;
+    use std::collections::hash_map::DefaultHasher;
     use std::iter;
     use std::str::FromStr;
 
@@ -1414,14 +1525,14 @@ mod tests {
 
     fn get_data() -> Vec<(Name, Vec<u8>)> {
         vec![
-            (Name::new(), vec![0]),                           // base case, only the root
-            (Name::from_str("a").unwrap(), vec![1, b'a', 0]), // a single 'a' label
+            (Name::from_str(".").unwrap(), vec![0]), // base case, only the root
+            (Name::from_str("a.").unwrap(), vec![1, b'a', 0]), // a single 'a' label
             (
-                Name::from_str("a.bc").unwrap(),
+                Name::from_str("a.bc.").unwrap(),
                 vec![1, b'a', 2, b'b', b'c', 0],
             ), // two labels, 'a.bc'
             (
-                Name::from_str("a.♥").unwrap(),
+                Name::from_str("a.♥.").unwrap(),
                 vec![1, b'a', 7, b'x', b'n', b'-', b'-', b'g', b'6', b'h', 0],
             ), // two labels utf8, 'a.♥'
         ]
@@ -1439,7 +1550,7 @@ mod tests {
 
     #[test]
     fn test_read() {
-        test_read_data_set(get_data(), |ref mut d| Name::read(d));
+        test_read_data_set(get_data(), |mut d| Name::read(&mut d));
     }
 
     #[test]
@@ -1449,12 +1560,12 @@ mod tests {
 
     #[test]
     fn test_pointer() {
-        let mut bytes: Vec<u8> = Vec::with_capacity(512);
+        let mut bytes = Vec::with_capacity(512);
 
-        let first = Name::from_str("ra.rb.rc").unwrap();
-        let second = Name::from_str("rb.rc").unwrap();
-        let third = Name::from_str("rc").unwrap();
-        let fourth = Name::from_str("z.ra.rb.rc").unwrap();
+        let first = Name::from_str("ra.rb.rc.").unwrap();
+        let second = Name::from_str("rb.rc.").unwrap();
+        let third = Name::from_str("rc.").unwrap();
+        let fourth = Name::from_str("z.ra.rb.rc.").unwrap();
 
         {
             let mut e = BinEncoder::new(&mut bytes);
@@ -1493,9 +1604,9 @@ mod tests {
     fn test_pointer_with_pointer_ending_labels() {
         let mut bytes: Vec<u8> = Vec::with_capacity(512);
 
-        let first = Name::from_str("ra.rb.rc").unwrap();
-        let second = Name::from_str("ra.rc").unwrap();
-        let third = Name::from_str("ra.rc").unwrap();
+        let first = Name::from_str("ra.rb.rc.").unwrap();
+        let second = Name::from_str("ra.rc.").unwrap();
+        let third = Name::from_str("ra.rc.").unwrap();
 
         {
             let mut e = BinEncoder::new(&mut bytes);
@@ -1589,7 +1700,7 @@ mod tests {
     fn test_base_name() {
         let zone = Name::from_str("example.com.").unwrap();
 
-        assert_eq!(zone.base_name(), Name::from_str("com").unwrap());
+        assert_eq!(zone.base_name(), Name::from_str("com.").unwrap());
         assert!(zone.base_name().base_name().is_root());
         assert!(zone.base_name().base_name().base_name().is_root());
     }
@@ -1652,24 +1763,24 @@ mod tests {
                 Name::from_ascii("Z.a.example.").unwrap(),
             ),
             (
-                Name::from_ascii("Z.a.example.").unwrap(),
-                Name::from_ascii("zABC.a.EXAMPLE").unwrap(),
+                Name::from_ascii("Z.a.example").unwrap(),
+                Name::from_ascii("zABC.a.EXAMPLE.").unwrap(),
             ),
             (
                 Name::from_ascii("zABC.a.EXAMPLE.").unwrap(),
                 Name::from_str("z.example.").unwrap(),
             ),
             (
-                Name::from_str("z.example.").unwrap(),
-                Name::from_labels(vec![&[1u8] as &[u8], b"z", b"example"]).unwrap(),
+                Name::from_str("z.example").unwrap(),
+                Name::from_labels(vec![&[1u8] as &[u8], b"z", b"example."]).unwrap(),
             ),
             (
                 Name::from_labels(vec![&[1u8] as &[u8], b"z", b"example"]).unwrap(),
                 Name::from_str("*.z.example.").unwrap(),
             ),
             (
-                Name::from_str("*.z.example.").unwrap(),
-                Name::from_labels(vec![&[200u8] as &[u8], b"z", b"example"]).unwrap(),
+                Name::from_str("*.z.example").unwrap(),
+                Name::from_labels(vec![&[200u8] as &[u8], b"z", b"example."]).unwrap(),
             ),
         ];
 
@@ -1701,7 +1812,7 @@ mod tests {
     #[test]
     fn test_from_ipv4() {
         let ip = IpAddr::V4(Ipv4Addr::new(26, 3, 0, 103));
-        let name = Name::from_str("103.0.3.26.in-addr.arpa").unwrap();
+        let name = Name::from_str("103.0.3.26.in-addr.arpa.").unwrap();
 
         assert_eq!(Into::<Name>::into(ip), name);
     }
@@ -1710,7 +1821,7 @@ mod tests {
     fn test_from_ipv6() {
         let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1));
         let name = Name::from_str(
-            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
         )
         .unwrap();
 
@@ -1831,7 +1942,7 @@ mod tests {
         }
 
         assert!(result.is_err());
-        match *result.unwrap_err().kind() {
+        match result.unwrap_err().kind() {
             ProtoErrorKind::MaxBufferSizeExceeded(_) => (),
             _ => panic!(),
         }
@@ -2108,5 +2219,220 @@ mod tests {
 
         let name = Name::from_utf8(".").unwrap();
         assert!(name.is_fqdn());
+    }
+
+    #[test]
+    #[allow(clippy::nonminimal_bool)]
+    fn test_name_partialeq_constraints() {
+        let example_fqdn = Name::from_utf8("example.com.").unwrap();
+        let example_nonfqdn = Name::from_utf8("example.com").unwrap();
+        let other_fqdn = Name::from_utf8("otherdomain.com.").unwrap();
+
+        assert_eq!(example_fqdn, example_fqdn);
+        assert_eq!(example_nonfqdn, example_nonfqdn);
+        assert!(example_fqdn != example_nonfqdn);
+
+        // a != b if and only if !(a == b).
+        assert!(example_fqdn != example_nonfqdn && !(example_fqdn == example_nonfqdn));
+        assert!(example_nonfqdn != example_fqdn && !(example_nonfqdn == example_fqdn));
+        assert!(example_fqdn != other_fqdn && !(example_fqdn == other_fqdn));
+        assert!(example_nonfqdn != other_fqdn && !(example_nonfqdn == other_fqdn));
+    }
+
+    #[test]
+    fn test_name_partialord_constraints() {
+        use std::cmp::Ordering::*;
+
+        let example_fqdn = Name::from_utf8("example.com.").unwrap();
+        let foo_example_fqdn = Name::from_utf8("foo.example.com.").unwrap();
+        let example_nonfqdn = Name::from_utf8("example.com").unwrap();
+        let foo_example_nonfqdn = Name::from_utf8("foo.example.com").unwrap();
+
+        // 1. a == b if and only if partial_cmp(a, b) == Some(Equal).
+        assert_eq!(example_fqdn.partial_cmp(&example_fqdn), Some(Equal),);
+        assert!(example_fqdn.partial_cmp(&example_nonfqdn) != Some(Equal));
+
+        // 2. a < b if and only if partial_cmp(a, b) == Some(Less)
+        assert!(
+            example_nonfqdn < example_fqdn
+                && example_nonfqdn.partial_cmp(&example_fqdn) == Some(Less)
+        );
+
+        assert!(
+            example_fqdn < foo_example_fqdn
+                && example_fqdn.partial_cmp(&foo_example_fqdn) == Some(Less)
+        );
+
+        assert!(
+            example_nonfqdn < foo_example_nonfqdn
+                && example_nonfqdn.partial_cmp(&foo_example_nonfqdn) == Some(Less)
+        );
+
+        // 3. a > b) if and only if partial_cmp(a, b) == Some(Greater)
+        assert!(
+            example_fqdn > example_nonfqdn
+                && example_fqdn.partial_cmp(&example_nonfqdn) == Some(Greater)
+        );
+
+        assert!(
+            foo_example_fqdn > example_fqdn
+                && foo_example_fqdn.partial_cmp(&example_fqdn) == Some(Greater)
+        );
+
+        assert!(
+            foo_example_nonfqdn > example_nonfqdn
+                && foo_example_nonfqdn.partial_cmp(&example_nonfqdn) == Some(Greater)
+        );
+
+        // 4. a <= b if and only if a < b || a == b
+        assert!(example_nonfqdn <= example_fqdn);
+        assert!(example_nonfqdn <= example_nonfqdn);
+        assert!(example_fqdn <= example_fqdn);
+        assert!(example_nonfqdn <= foo_example_nonfqdn);
+        assert!(example_fqdn <= foo_example_fqdn);
+        assert!(foo_example_nonfqdn <= foo_example_nonfqdn);
+        assert!(foo_example_fqdn <= foo_example_fqdn);
+
+        // 5. a >= b if and only if a > b || a == b
+        assert!(example_fqdn >= example_nonfqdn);
+        assert!(example_nonfqdn >= example_nonfqdn);
+        assert!(example_fqdn >= example_fqdn);
+        assert!(foo_example_nonfqdn >= example_nonfqdn);
+        assert!(foo_example_fqdn >= example_fqdn);
+        assert!(foo_example_nonfqdn >= foo_example_nonfqdn);
+        assert!(foo_example_fqdn >= foo_example_fqdn);
+
+        // 6. a != b if and only if !(a == b). -- Tested in test_name_partialeq_constraints.
+    }
+
+    #[test]
+    fn test_name_ord_constraints() {
+        use std::cmp;
+
+        let example_fqdn = Name::from_utf8("example.com.").unwrap();
+        let foo_example_fqdn = Name::from_utf8("foo.example.com.").unwrap();
+        let example_nonfqdn = Name::from_utf8("example.com").unwrap();
+        let foo_example_nonfqdn = Name::from_utf8("foo.example.com").unwrap();
+
+        // These are consistency checks between Ord and PartialOrd; therefore
+        // we don't really care about picking the individual mappings and want
+        // to test on all possible combinations.
+        for pair in [
+            (&example_fqdn, &example_fqdn),
+            (&example_fqdn, &example_nonfqdn),
+            (&example_fqdn, &foo_example_fqdn),
+            (&example_fqdn, &foo_example_nonfqdn),
+            (&example_nonfqdn, &example_nonfqdn),
+            (&example_nonfqdn, &example_fqdn),
+            (&example_nonfqdn, &foo_example_fqdn),
+            (&example_nonfqdn, &foo_example_nonfqdn),
+            (&foo_example_fqdn, &example_nonfqdn),
+            (&foo_example_fqdn, &example_fqdn),
+            (&foo_example_fqdn, &foo_example_fqdn),
+            (&foo_example_fqdn, &foo_example_nonfqdn),
+            (&foo_example_fqdn, &example_nonfqdn),
+            (&foo_example_fqdn, &example_fqdn),
+            (&foo_example_fqdn, &foo_example_fqdn),
+            (&foo_example_fqdn, &foo_example_nonfqdn),
+        ] {
+            let name1 = pair.0;
+            let name2 = pair.1;
+
+            // 1. partial_cmp(a, b) == Some(cmp(a, b)).
+            assert_eq!(name1.partial_cmp(name2), Some(name1.cmp(name2)));
+
+            // 2. max(a, b) == max_by(a, b, cmp) (ensured by the default implementation).
+            assert_eq!(
+                name1.clone().max(name2.clone()),
+                cmp::max_by(name1.clone(), name2.clone(), |x: &Name, y: &Name| x.cmp(y)),
+            );
+
+            // 3. min(a, b) == min_by(a, b, cmp) (ensured by the default implementation).
+            assert_eq!(
+                name1.clone().min(name2.clone()),
+                cmp::min_by(name1.clone(), name2.clone(), |x: &Name, y: &Name| x.cmp(y)),
+            );
+        }
+
+        // 4. For a.clamp(min, max), see the method docs (ensured by the default implementation).
+        //
+        // Restrict a value to a certain interval.
+        // Returns max if self is greater than max, and min if self is less than min.
+        // Otherwise this returns self.
+        //
+        // Panics if min > max -- tested in test_ord_clamp_panic
+        let min_name = Name::from_utf8("com").unwrap();
+        let max_name = Name::from_utf8("max.example.com.").unwrap();
+
+        assert_eq!(
+            min_name
+                .clone()
+                .clamp(min_name.clone(), example_nonfqdn.clone()),
+            min_name.clone(),
+        );
+
+        assert_eq!(
+            max_name
+                .clone()
+                .clamp(example_nonfqdn.clone(), example_fqdn.clone()),
+            example_fqdn.clone(),
+        );
+
+        assert_eq!(
+            max_name
+                .clone()
+                .clamp(example_nonfqdn.clone(), max_name.clone()),
+            max_name.clone(),
+        );
+
+        // Transitivity tests
+        // if A < B and B < C then A < C
+        // if A > B and B > C then A > C
+        let most_min_name = Name::from_utf8("").unwrap();
+        let most_max_name = Name::from_utf8("most.max.example.com.").unwrap();
+        assert_eq!(min_name.cmp(&example_nonfqdn), Ordering::Less);
+        assert_eq!(most_min_name.cmp(&min_name), Ordering::Less);
+        assert_eq!(most_min_name.cmp(&example_nonfqdn), Ordering::Less);
+        assert_eq!(max_name.cmp(&example_fqdn), Ordering::Greater);
+        assert_eq!(most_max_name.cmp(&max_name), Ordering::Greater);
+        assert_eq!(most_max_name.cmp(&example_fqdn), Ordering::Greater);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_ord_clamp_panic() {
+        let min_name = Name::from_utf8("com").unwrap();
+        let max_name = Name::from_utf8("max.example.com.").unwrap();
+
+        // this should panic since min > max
+        let _ = min_name.clone().clamp(max_name, min_name);
+    }
+
+    #[test]
+    fn test_hash() {
+        // verify that two identical names with and without the trailing dot hashes to the same value
+        let mut hasher = DefaultHasher::new();
+        let with_dot = Name::from_utf8("com.").unwrap();
+        with_dot.hash(&mut hasher);
+        let hash_with_dot = hasher.finish();
+
+        let mut hasher = DefaultHasher::new();
+        let without_dot = Name::from_utf8("com").unwrap();
+        without_dot.hash(&mut hasher);
+        let hash_without_dot = hasher.finish();
+        assert_ne!(with_dot, without_dot);
+        assert_ne!(hash_with_dot, hash_without_dot);
+    }
+
+    #[test]
+    fn eq_ignore_root_tests() {
+        let fqdn_name = Name::from_utf8("host.example.com.").unwrap();
+        let relative_name = Name::from_utf8("host.example.com").unwrap();
+        let upper_relative_name = Name::from_ascii("HOST.EXAMPLE.COM").unwrap();
+
+        assert_ne!(fqdn_name, relative_name);
+        assert!(fqdn_name.eq_ignore_root(&relative_name));
+        assert!(!fqdn_name.eq_ignore_root_case(&upper_relative_name));
+        assert!(fqdn_name.eq_ignore_root(&upper_relative_name));
     }
 }

@@ -3,9 +3,10 @@
 use core::result::Result as CoreResult;
 use core::str::FromStr;
 use core::{array, fmt};
-use std::any;
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::net::Ipv4Addr;
+use std::{any, mem};
 
 use crate::{Error, Result, DEFAULT_TTL, FQDN};
 
@@ -16,13 +17,15 @@ macro_rules! record_types {
         #[allow(clippy::upper_case_acronyms)]
         #[derive(Debug, PartialEq, Clone)]
         pub enum RecordType {
-            $($variant),*
+            $($variant),*,
+            Unknown(u16),
         }
 
         impl RecordType {
-            pub fn as_str(&self) -> &'static str {
+            pub fn as_name(&self) -> Cow<'static, str> {
                 match self {
-                    $(Self::$variant => stringify!($variant)),*
+                    $(Self::$variant => Cow::Borrowed(stringify!($variant))),*,
+                    Self::Unknown(code) => Cow::Owned(format!("type{code}")),
                 }
             }
         }
@@ -35,19 +38,26 @@ macro_rules! record_types {
                     return Ok(Self::$variant);
                 })*
 
+                let lowercase = input.to_lowercase();
+                if let Some(type_code_str) = lowercase.strip_prefix("type") {
+                    if let Ok(type_code) = type_code_str.parse() {
+                        return Ok(Self::Unknown(type_code))
+                    }
+                }
+
                 Err(format!("unknown record type: {input}").into())
             }
         }
 
         impl fmt::Display for RecordType {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(self.as_str())
+                f.write_str(self.as_name().as_ref())
             }
         }
     };
 }
 
-record_types!(A, AAAA, CNAME, DNSKEY, DS, MX, NS, NSEC3, NSEC3PARAM, RRSIG, SOA, TXT);
+record_types!(A, AAAA, CNAME, DNSKEY, DS, MX, NS, NSEC, NSEC3, NSEC3PARAM, RRSIG, SOA, TXT);
 
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
@@ -57,10 +67,12 @@ pub enum Record {
     DNSKEY(DNSKEY),
     DS(DS),
     NS(NS),
+    NSEC(NSEC),
     NSEC3(NSEC3),
     NSEC3PARAM(NSEC3PARAM),
     RRSIG(RRSIG),
     SOA(SOA),
+    TXT(TXT),
 }
 
 impl From<NSEC3> for Record {
@@ -152,6 +164,14 @@ impl Record {
         }
     }
 
+    pub fn try_into_txt(self) -> CoreResult<TXT, Self> {
+        if let Self::TXT(txt) = self {
+            Ok(txt)
+        } else {
+            Err(self)
+        }
+    }
+
     pub fn is_soa(&self) -> bool {
         matches!(self, Self::SOA(..))
     }
@@ -215,10 +235,12 @@ impl FromStr for Record {
             "DNSKEY" => Record::DNSKEY(input.parse()?),
             "DS" => Record::DS(input.parse()?),
             "NS" => Record::NS(input.parse()?),
+            "NSEC" => Record::NSEC(input.parse()?),
             "NSEC3" => Record::NSEC3(input.parse()?),
             "NSEC3PARAM" => Record::NSEC3PARAM(input.parse()?),
             "RRSIG" => Record::RRSIG(input.parse()?),
             "SOA" => Record::SOA(input.parse()?),
+            "TXT" => Record::TXT(input.parse()?),
             _ => return Err(format!("unknown record type: {record_type}").into()),
         };
 
@@ -234,10 +256,12 @@ impl fmt::Display for Record {
             Record::DS(ds) => write!(f, "{ds}"),
             Record::DNSKEY(dnskey) => write!(f, "{dnskey}"),
             Record::NS(ns) => write!(f, "{ns}"),
+            Record::NSEC(nsec) => write!(f, "{nsec}"),
             Record::NSEC3(nsec3) => write!(f, "{nsec3}"),
             Record::NSEC3PARAM(nsec3param) => write!(f, "{nsec3param}"),
             Record::RRSIG(rrsig) => write!(f, "{rrsig}"),
             Record::SOA(soa) => write!(f, "{soa}"),
+            Record::TXT(txt) => write!(f, "{txt}"),
         }
     }
 }
@@ -576,6 +600,63 @@ impl FromStr for NS {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NSEC {
+    pub fqdn: FQDN,
+    pub ttl: u32,
+    pub next_domain: FQDN,
+    pub record_types: Vec<RecordType>,
+}
+
+impl FromStr for NSEC {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let mut columns = input.split_whitespace();
+
+        let [Some(fqdn), Some(ttl), Some(class), Some(record_type), Some(next_domain)] =
+            array::from_fn(|_| columns.next())
+        else {
+            return Err("expected at least 5 columns".into());
+        };
+
+        check_record_type::<Self>(record_type)?;
+        check_class(class)?;
+
+        let mut record_types = vec![];
+        for column in columns {
+            record_types.push(column.parse()?);
+        }
+
+        Ok(Self {
+            fqdn: fqdn.parse()?,
+            ttl: ttl.parse()?,
+            next_domain: next_domain.parse()?,
+            record_types,
+        })
+    }
+}
+
+impl fmt::Display for NSEC {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            fqdn,
+            ttl,
+            next_domain,
+            record_types,
+        } = self;
+
+        let record_type = unqualified_type_name::<Self>();
+        write!(f, "{fqdn}\t{ttl}\t{CLASS}\t{record_type}\t{next_domain}")?;
+
+        for record_type in record_types {
+            write!(f, " {record_type}")?;
+        }
+
+        Ok(())
+    }
+}
+
 // integer types chosen based on bit sizes in section 3.2 of RFC5155
 #[derive(Debug, Clone, PartialEq)]
 pub struct NSEC3 {
@@ -877,6 +958,133 @@ impl fmt::Display for SoaSettings {
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone)]
+pub struct TXT {
+    pub zone: FQDN,
+    pub ttl: u32,
+    pub character_strings: Vec<String>,
+}
+
+impl FromStr for TXT {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let mut rest = input;
+        let [Some(zone), Some(ttl), Some(class), Some(record_type)] = array::from_fn(|_| {
+            if let Some((left, right)) = rest.split_once(|c| char::is_ascii_whitespace(&c)) {
+                rest = right.trim();
+                Some(left)
+            } else {
+                let trimmed = rest.trim();
+                rest = "";
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+        }) else {
+            return Err("expected at least 5 columns".into());
+        };
+
+        check_record_type::<Self>(record_type)?;
+        check_class(class)?;
+
+        let mut character_strings = Vec::new();
+        let mut current_string = String::new();
+
+        enum State {
+            /// At the start of the input, or after a string.
+            Whitespace,
+            /// In an unquoted string.
+            UnquotedString,
+            /// In a quoted string.
+            QuotedString,
+        }
+
+        let mut state = State::Whitespace;
+        for character in rest.chars() {
+            if !character.is_ascii() {
+                return Err("non-ASCII characters in TXT records are not supported".into());
+            }
+            match (state, character) {
+                (State::Whitespace, character) if character.is_ascii_whitespace() => {
+                    state = State::Whitespace;
+                }
+                (State::Whitespace, '"') => {
+                    state = State::QuotedString;
+                }
+                (State::UnquotedString, character) if character.is_ascii_whitespace() => {
+                    character_strings.push(mem::take(&mut current_string));
+                    state = State::Whitespace;
+                }
+                (State::QuotedString, '"') => {
+                    character_strings.push(mem::take(&mut current_string));
+                    state = State::Whitespace;
+                }
+                (State::Whitespace, '(') => {
+                    return Err("multi-line TXT records are not supported".into());
+                }
+                (_, '@') => {
+                    return Err(
+                        "denoting the current origin with @ in TXT records is not supported".into(),
+                    );
+                }
+                (_, '\\') => {
+                    return Err("backslash escapes in TXT records are not supported".into());
+                }
+                (State::Whitespace | State::UnquotedString, character) => {
+                    current_string.push(character);
+                    state = State::UnquotedString;
+                }
+                (State::QuotedString, character) => {
+                    current_string.push(character);
+                    state = State::QuotedString;
+                }
+            }
+        }
+        match state {
+            State::Whitespace => {}
+            State::UnquotedString => character_strings.push(mem::take(&mut current_string)),
+            State::QuotedString => return Err("quoted string in TXT record was not closed".into()),
+        }
+
+        if character_strings.is_empty() {
+            return Err("expected at least 5 columns".into());
+        }
+
+        Ok(Self {
+            zone: zone.parse()?,
+            ttl: ttl.parse()?,
+            character_strings,
+        })
+    }
+}
+
+impl fmt::Display for TXT {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            zone,
+            ttl,
+            character_strings,
+        } = self;
+
+        let record_type = unqualified_type_name::<Self>();
+        write!(f, "{zone}\t{ttl}\t{CLASS}\t{record_type}")?;
+        let mut is_first = true;
+        for string in character_strings.iter() {
+            if is_first {
+                write!(f, "\t\"{string}\"")?;
+                is_first = false;
+            } else {
+                write!(f, " \"{string}\"")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn check_class(class: &str) -> Result<()> {
     if class != "IN" {
         return Err(format!("unknown class: {class}").into());
@@ -1100,6 +1308,38 @@ mod tests {
         Ok(())
     }
 
+    const NSEC_INPUT: &str =
+        "hickory-dns.testing.	86400	IN	NSEC	primary1.hickory-dns.testing. NS SOA RRSIG NSEC DNSKEY";
+
+    #[test]
+    fn nsec() -> Result<()> {
+        let nsec @ NSEC {
+            fqdn,
+            ttl,
+            next_domain,
+            record_types,
+        } = &NSEC_INPUT.parse()?;
+
+        assert_eq!("hickory-dns.testing.", fqdn.as_str());
+        assert_eq!(86400, *ttl);
+        assert_eq!("primary1.hickory-dns.testing.", next_domain.as_str());
+        assert_eq!(
+            [
+                RecordType::NS,
+                RecordType::SOA,
+                RecordType::RRSIG,
+                RecordType::NSEC,
+                RecordType::DNSKEY,
+            ],
+            record_types.as_slice()
+        );
+
+        let output = nsec.to_string();
+        assert_eq!(NSEC_INPUT, output);
+
+        Ok(())
+    }
+
     // dig +dnssec A unicorn.example.com.
     const NSEC3_INPUT: &str = "abhif1b25fhcda5amfk5hnrsh6jid2ki.example.com.	3571	IN	NSEC3	1 0 5 53BCBC5805D2B761  GVPMD82B8ER38VUEGP72I721LIH19RGR A NS SOA MX TXT AAAA RRSIG DNSKEY NSEC3PARAM";
 
@@ -1235,17 +1475,47 @@ mod tests {
         Ok(())
     }
 
+    // from the `truncated_with_tcp_fallback.py` test server.
+    const TXT_INPUT: &str = r#"example.testing.	0	IN	TXT	"protocol=TCP" "counter=0""#;
+
+    #[test]
+    fn txt() -> Result<()> {
+        let txt: TXT = TXT_INPUT.parse()?;
+
+        assert_eq!("example.testing.", txt.zone.as_str());
+        assert_eq!(0, txt.ttl);
+        assert_eq!(
+            vec!["protocol=TCP".to_owned(), "counter=0".to_owned()],
+            txt.character_strings
+        );
+
+        let output = txt.to_string();
+        assert_eq!(TXT_INPUT, output);
+
+        Ok(())
+    }
+
     #[test]
     fn any() -> Result<()> {
         assert!(matches!(A_INPUT.parse()?, Record::A(..)));
         assert!(matches!(DNSKEY_INPUT.parse()?, Record::DNSKEY(..)));
         assert!(matches!(DS_INPUT.parse()?, Record::DS(..)));
         assert!(matches!(NS_INPUT.parse()?, Record::NS(..)));
+        assert!(matches!(NSEC_INPUT.parse()?, Record::NSEC(..)));
         assert!(matches!(NSEC3_INPUT.parse()?, Record::NSEC3(..)));
         assert!(matches!(NSEC3PARAM_INPUT.parse()?, Record::NSEC3PARAM(..)));
         assert!(matches!(RRSIG_INPUT.parse()?, Record::RRSIG(..)));
         assert!(matches!(SOA_INPUT.parse()?, Record::SOA(..)));
+        assert!(matches!(TXT_INPUT.parse()?, Record::TXT(..)));
 
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_type_round_trip() -> Result<()> {
+        assert_eq!(RecordType::from_str("type1000")?, RecordType::Unknown(1000));
+        assert_eq!(RecordType::from_str("TYPE1000")?, RecordType::Unknown(1000));
+        assert_eq!(RecordType::Unknown(1000).as_name(), "type1000");
         Ok(())
     }
 }

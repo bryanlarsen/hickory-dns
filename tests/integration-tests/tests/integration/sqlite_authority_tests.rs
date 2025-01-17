@@ -1,19 +1,21 @@
 #![cfg(feature = "sqlite")]
 
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
+use hickory_proto::rr::LowerName;
 use rusqlite::*;
 
-use hickory_proto::op::*;
-use hickory_proto::rr::dnssec::*;
-use hickory_proto::rr::rdata::*;
-use hickory_proto::rr::*;
-
+use hickory_proto::dnssec::SupportedAlgorithms;
+use hickory_proto::op::{Header, LowerQuery, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::rdata::{A, AAAA, NS, TXT};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::xfer::Protocol;
 use hickory_server::authority::LookupOptions;
 use hickory_server::authority::{Authority, ZoneType};
 #[cfg(feature = "dnssec")]
-use hickory_server::config::dnssec::NxProofKind;
-use hickory_server::server::Protocol;
+use hickory_server::dnssec::NxProofKind;
 use hickory_server::server::RequestInfo;
 use hickory_server::store::in_memory::InMemoryAuthority;
 use hickory_server::store::sqlite::{Journal, SqliteAuthority};
@@ -40,7 +42,7 @@ async fn test_search() {
     query.set_name(origin.into());
     let query = LowerQuery::from(query);
     let request_info = RequestInfo::new(
-        "127.0.0.1:53".parse().unwrap(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
         TEST_HEADER,
         &query,
@@ -70,7 +72,7 @@ async fn test_search_www() {
     query.set_name(www_name);
     let query = LowerQuery::from(query);
     let request_info = RequestInfo::new(
-        "127.0.0.1:53".parse().unwrap(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
         TEST_HEADER,
         &query,
@@ -553,8 +555,8 @@ async fn test_pre_scan() {
 
 #[tokio::test]
 async fn test_update() {
-    let new_name = Name::from_str("new.example.com").unwrap();
-    let www_name = Name::from_str("www.example.com").unwrap();
+    let new_name = Name::from_str("new.example.com.").unwrap();
+    let www_name = Name::from_str("www.example.com.").unwrap();
     let mut authority = create_example();
     let serial = authority.serial().await;
 
@@ -795,7 +797,7 @@ async fn test_update() {
 #[tokio::test]
 #[allow(clippy::uninlined_format_args)]
 async fn test_zone_signing() {
-    use hickory_proto::rr::dnssec::rdata::RRSIG;
+    use hickory_proto::{dnssec::rdata::RRSIG, rr::RecordData};
 
     let authority = create_secure_example();
 
@@ -863,7 +865,7 @@ async fn test_zone_signing() {
 #[cfg(feature = "dnssec")]
 #[tokio::test]
 async fn test_get_nsec() {
-    let name = Name::from_str("zzz.example.com").unwrap();
+    let name = Name::from_str("zzz.example.com.").unwrap();
     let authority = create_secure_example();
     let lower_name = LowerName::from(name.clone());
 
@@ -891,8 +893,8 @@ async fn test_journal() {
     authority.set_journal(journal).await;
     authority.persist_to_journal().await.unwrap();
 
-    let new_name = Name::from_str("new.example.com").unwrap();
-    let delete_name = Name::from_str("www.example.com").unwrap();
+    let new_name = Name::from_str("new.example.com.").unwrap();
+    let delete_name = Name::from_str("www.example.com.").unwrap();
     let new_record =
         Record::from_rdata(new_name.clone(), 0, RData::A(A::new(10, 11, 12, 13))).clone();
     let delete_record =
@@ -1049,7 +1051,7 @@ async fn test_axfr() {
         RecordType::AXFR,
     ));
     let request_info = RequestInfo::new(
-        "127.0.0.1:53".parse().unwrap(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
         TEST_HEADER,
         &query,
@@ -1074,7 +1076,7 @@ async fn test_refused_axfr() {
         RecordType::AXFR,
     ));
     let request_info = RequestInfo::new(
-        "127.0.0.1:53".parse().unwrap(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
         Protocol::Udp,
         TEST_HEADER,
         &query,

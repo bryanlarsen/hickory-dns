@@ -1,16 +1,9 @@
 #![recursion_limit = "128"]
 
-use {
-    futures_util::future,
-    hickory_resolver::name_server::TokioConnectionProvider,
-    hickory_resolver::TokioAsyncResolver,
-    hickory_resolver::{IntoName, TryParseIp},
-    once_cell::sync::Lazy,
-    std::fmt::Display,
-    std::io,
-    std::net::SocketAddr,
-    std::task::Poll,
-};
+use std::{fmt::Display, future::pending, io, net::SocketAddr};
+
+use hickory_resolver::{name_server::TokioConnectionProvider, IntoName, TokioResolver};
+use once_cell::sync::Lazy;
 
 // This is an example of registering a static global resolver into any system.
 //
@@ -18,15 +11,14 @@ use {
 //   in the mean time, this example has the necessary steps to do so.
 //
 // Thank you to @zonyitoo for the original example.
-// TODO: this example can probably be made much simpler with the new
-//      `AsyncResolver`.
+// TODO: this example can probably be made much simpler with `Resolver`.
 // First we need to setup the global Resolver
-static GLOBAL_DNS_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
+static GLOBAL_DNS_RESOLVER: Lazy<TokioResolver> = Lazy::new(|| {
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
 
     // We'll be using this condvar to get the Resolver from the thread...
-    let pair = Arc::new((Mutex::new(None::<TokioAsyncResolver>), Condvar::new()));
+    let pair = Arc::new((Mutex::new(None::<TokioResolver>), Condvar::new()));
     let pair2 = pair.clone();
 
     // Spawn the runtime to a new thread...
@@ -42,7 +34,7 @@ static GLOBAL_DNS_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
             #[cfg(any(unix, windows))]
             {
                 // use the system resolver configuration
-                TokioAsyncResolver::from_system_conf(TokioConnectionProvider::default())
+                TokioResolver::from_system_conf(TokioConnectionProvider::default())
             }
 
             // For other operating systems, we can use one of the preconfigured definitions
@@ -52,7 +44,7 @@ static GLOBAL_DNS_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
                 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 
                 // Get a new resolver with the google nameservers as the upstream recursive resolvers
-                TokioAsyncResolver::new(
+                TokioResolver::new(
                     ResolverConfig::google(),
                     ResolverOpts::default(),
                     runtime.handle().clone(),
@@ -69,7 +61,7 @@ static GLOBAL_DNS_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
         cvar.notify_one();
         drop(started);
 
-        runtime.block_on(future::poll_fn(|_cx| Poll::<()>::Pending))
+        runtime.block_on(pending::<()>())
     });
 
     // Wait for the thread to start up.
@@ -90,7 +82,7 @@ static GLOBAL_DNS_RESOLVER: Lazy<TokioAsyncResolver> = Lazy::new(|| {
 ///
 /// This looks up the `host` (a `&str` or `String` is good), and combines that with the provided port
 ///   this mimics the lookup functions of `std::net`.
-pub async fn resolve<N: IntoName + Display + TryParseIp + 'static>(
+pub async fn resolve<N: IntoName + Display + 'static>(
     host: N,
     port: u16,
 ) -> io::Result<Vec<SocketAddr>> {

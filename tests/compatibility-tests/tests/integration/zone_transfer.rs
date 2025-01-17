@@ -5,21 +5,18 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-#[cfg(not(feature = "none"))]
+#![cfg(not(feature = "none"))]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(not(feature = "none"))]
 use std::str::FromStr;
 
-#[cfg(not(feature = "none"))]
+use futures::TryStreamExt;
 use time::Duration;
 
-#[cfg(not(feature = "none"))]
-use hickory_client::client::{Client, SyncClient};
-#[cfg(not(feature = "none"))]
+use hickory_client::client::{Client, ClientHandle};
 use hickory_client::proto::rr::{Name, RData, Record, RecordType};
-#[cfg(not(feature = "none"))]
-use hickory_client::tcp::TcpClientConnection;
-#[cfg(not(feature = "none"))]
+use hickory_client::proto::tcp::TcpClientStream;
+use hickory_client::proto::xfer::DnsMultiplexer;
 use hickory_compatibility::named_process;
 
 #[allow(unused)]
@@ -29,25 +26,32 @@ macro_rules! assert_serial {
         if let RData::SOA(soa) = rdata {
             assert_eq!(soa.serial(), $serial);
         } else {
-            assert!(false, "record was not a SOA");
+            panic!("record was not a SOA");
         }
     }};
 }
 
-#[cfg(not(feature = "none"))]
-#[test]
-#[allow(unused)]
-fn test_zone_transfer() {
-    use hickory_client::proto::rr::rdata::A;
+#[tokio::test]
+async fn test_zone_transfer() {
+    use hickory_client::proto::{rr::rdata::A, runtime::TokioRuntimeProvider};
 
-    let (process, port) = named_process();
-    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-    let conn = TcpClientConnection::new(socket).unwrap();
-    let client = SyncClient::new(conn);
+    let (_process, port) = named_process();
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let (stream, sender) =
+        TcpClientStream::new(socket, None, None, TokioRuntimeProvider::default());
+    let multiplexer = DnsMultiplexer::new(stream, sender, None);
+
+    let (mut client, driver) = Client::connect(multiplexer)
+        .await
+        .expect("failed to connect");
+    tokio::spawn(driver);
 
     let name = Name::from_str("example.net.").unwrap();
-    let result = client.zone_transfer(&name, None).expect("query failed");
-    let result = result.collect::<Result<Vec<_>, _>>().unwrap();
+    let result = client
+        .zone_transfer(name.clone(), None)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query failed");
     assert_ne!(result.len(), 1);
     assert_eq!(
         result.iter().map(|r| r.answers().len()).sum::<usize>(),
@@ -72,18 +76,22 @@ fn test_zone_transfer() {
         RecordType::SOA
     );
 
-    let mut record = Record::from_rdata(
+    let record = Record::from_rdata(
         Name::from_str("new.example.net.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
 
-    client.create(record, name.clone()).expect("create failed");
+    client
+        .create(record, name.clone())
+        .await
+        .expect("create failed");
 
     let result = client
-        .zone_transfer(&name, Some(soa.clone()))
+        .zone_transfer(name, Some(soa.clone()))
+        .try_collect::<Vec<_>>()
+        .await
         .expect("query failed");
-    let result = result.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(result.len(), 1);
     let result = &result[0];
     assert_eq!(result.answers().len(), 3 + 2);

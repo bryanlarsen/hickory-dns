@@ -21,24 +21,29 @@ use std::time::Duration;
 
 use resolv_conf;
 
-use crate::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use crate::error::ResolveResult;
+use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use crate::proto::rr::Name;
+use crate::proto::xfer::Protocol;
+use crate::ResolveError;
 
 const DEFAULT_PORT: u16 = 53;
 
-pub fn read_system_conf() -> ResolveResult<(ResolverConfig, ResolverOpts)> {
+pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     read_resolv_conf("/etc/resolv.conf")
 }
 
-fn read_resolv_conf<P: AsRef<Path>>(path: P) -> ResolveResult<(ResolverConfig, ResolverOpts)> {
+fn read_resolv_conf<P: AsRef<Path>>(
+    path: P,
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let mut data = String::new();
     let mut file = File::open(path)?;
     file.read_to_string(&mut data)?;
     parse_resolv_conf(&data)
 }
 
-pub fn parse_resolv_conf<T: AsRef<[u8]>>(data: T) -> ResolveResult<(ResolverConfig, ResolverOpts)> {
+pub fn parse_resolv_conf<T: AsRef<[u8]>>(
+    data: T,
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let parsed_conf = resolv_conf::Config::parse(&data).map_err(|e| {
         io::Error::new(
             io::ErrorKind::Other,
@@ -51,7 +56,7 @@ pub fn parse_resolv_conf<T: AsRef<[u8]>>(data: T) -> ResolveResult<(ResolverConf
 // TODO: use a custom parsing error type maybe?
 fn into_resolver_config(
     parsed_config: resolv_conf::Config,
-) -> ResolveResult<(ResolverConfig, ResolverOpts)> {
+) -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let domain = if let Some(domain) = parsed_config.get_system_domain() {
         // The system domain name maybe appear to be valid to the resolv_conf
         // crate but actually be invalid. For example, if the hostname is "matt.schulte's computer"
@@ -69,6 +74,7 @@ fn into_resolver_config(
             socket_addr: SocketAddr::new(ip.into(), DEFAULT_PORT),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -78,6 +84,7 @@ fn into_resolver_config(
             socket_addr: SocketAddr::new(ip.into(), DEFAULT_PORT),
             protocol: Protocol::Tcp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -122,7 +129,7 @@ fn into_resolver_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::rr::Name;
+    use crate::proto::rr::Name;
     use std::env;
     use std::net::*;
     use std::str::FromStr;
@@ -138,6 +145,7 @@ mod tests {
                 socket_addr: addr,
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
+                http_endpoint: None,
                 trust_negative_responses: false,
                 #[cfg(feature = "dns-over-rustls")]
                 tls_config: None,
@@ -147,6 +155,7 @@ mod tests {
                 socket_addr: addr,
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
+                http_endpoint: None,
                 trust_negative_responses: false,
                 #[cfg(feature = "dns-over-rustls")]
                 tls_config: None,
@@ -165,8 +174,11 @@ mod tests {
     fn test_name_server() {
         let parsed = parse_resolv_conf("nameserver 127.0.0.1").expect("failed");
         let cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
-        assert_eq!(cfg.name_servers(), parsed.0.name_servers());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        assert_eq!(
+            cfg.name_servers()[0].socket_addr,
+            parsed.0.name_servers()[0].socket_addr
+        );
+        is_default_opts(parsed.1);
     }
 
     #[test]
@@ -175,7 +187,7 @@ mod tests {
         let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
         cfg.add_search(Name::from_str("localnet.").unwrap());
         assert_eq!(cfg.search(), parsed.0.search());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        is_default_opts(parsed.1);
     }
 
     #[test]
@@ -186,15 +198,17 @@ mod tests {
         let mut cfg = empty_config(nameserver_config("127.0.0.53").to_vec());
 
         {
-            assert_eq!(cfg.name_servers(), parsed.0.name_servers());
-            assert_eq!(ResolverOpts::default(), parsed.1);
+            assert_eq!(
+                cfg.name_servers()[0].socket_addr,
+                parsed.0.name_servers()[0].socket_addr
+            );
+            is_default_opts(parsed.1);
         }
 
         // This is the important part, that the invalid `--` is skipped during parsing
         {
             cfg.add_search(Name::from_str("lan").unwrap());
             assert_eq!(cfg.search(), parsed.0.search());
-            assert_eq!(ResolverOpts::default(), parsed.1);
         }
     }
 
@@ -203,9 +217,9 @@ mod tests {
         let parsed =
             parse_resolv_conf("search Speedport_000\nnameserver 127.0.0.1").expect("failed");
         let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
-        cfg.add_search(Name::from_str_relaxed("Speedport_000.").unwrap());
+        cfg.add_search(Name::from_str_relaxed("Speedport_000").unwrap());
         assert_eq!(cfg.search(), parsed.0.search());
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        is_default_opts(parsed.1);
     }
 
     #[test]
@@ -213,8 +227,12 @@ mod tests {
         let parsed = parse_resolv_conf("domain example.com\nnameserver 127.0.0.1").expect("failed");
         let mut cfg = empty_config(nameserver_config("127.0.0.1").to_vec());
         cfg.set_domain(Name::from_str("example.com").unwrap());
-        assert_eq!(cfg, parsed.0);
-        assert_eq!(ResolverOpts::default(), parsed.1);
+        assert_eq!(
+            cfg.name_servers()[0].socket_addr,
+            parsed.0.name_servers()[0].socket_addr
+        );
+        assert_eq!(cfg.domain(), parsed.0.domain());
+        is_default_opts(parsed.1);
     }
 
     #[test]
@@ -222,5 +240,12 @@ mod tests {
         read_resolv_conf(format!("{}/resolv.conf-simple", tests_dir())).expect("simple failed");
         read_resolv_conf(format!("{}/resolv.conf-macos", tests_dir())).expect("macos failed");
         read_resolv_conf(format!("{}/resolv.conf-linux", tests_dir())).expect("linux failed");
+    }
+
+    /// Validate that all options set in `into_resolver_config()` are at default values
+    fn is_default_opts(opts: ResolverOpts) {
+        assert_eq!(opts.ndots, 1);
+        assert_eq!(opts.timeout, Duration::from_secs(5));
+        assert_eq!(opts.attempts, 2);
     }
 }

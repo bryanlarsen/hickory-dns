@@ -12,33 +12,32 @@ use std::{
 };
 
 use futures_util::{FutureExt, StreamExt};
-use hickory_proto::{op::MessageType, rr::Record};
+use hickory_proto::{op::MessageType, rr::Record, runtime::TokioRuntimeProvider};
 use ipnet::IpNet;
 #[cfg(feature = "dns-over-rustls")]
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     ServerConfig,
 };
+#[cfg(feature = "dns-over-rustls")]
+use tokio::time::timeout;
 use tokio::{net, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-#[cfg(all(feature = "dns-over-openssl", not(feature = "dns-over-rustls")))]
-use crate::proto::openssl::tls_server::*;
 use crate::{
     access::AccessControl,
     authority::{MessageRequest, MessageResponseBuilder},
     proto::{
-        error::ProtoError,
-        iocompat::AsyncIoTokioAsStd,
-        op::{Edns, Header, LowerQuery, Query, ResponseCode},
+        op::{Header, LowerQuery, Query, ResponseCode},
+        runtime::iocompat::AsyncIoTokioAsStd,
         serialize::binary::{BinDecodable, BinDecoder},
         tcp::TcpStream,
         udp::UdpStream,
-        xfer::SerialMessage,
-        BufDnsStreamHandle,
+        xfer::{Protocol, SerialMessage},
+        BufDnsStreamHandle, ProtoError,
     },
-    server::{Protocol, Request, RequestHandler, ResponseHandle, ResponseHandler, TimeoutStream},
+    server::{Request, RequestHandler, ResponseHandle, ResponseHandler, TimeoutStream},
 };
 
 // TODO, would be nice to have a Slab for buffers here...
@@ -77,7 +76,7 @@ impl<T: RequestHandler> ServerFuture<T> {
         // create the new UdpStream, the IP address isn't relevant, and ideally goes essentially no where.
         //   the address used is acquired from the inbound queries
         let (mut stream, stream_handle) =
-            UdpStream::with_bound(socket, ([127, 255, 255, 254], 0).into());
+            UdpStream::<TokioRuntimeProvider>::with_bound(socket, ([127, 255, 255, 254], 0).into());
         let shutdown = self.shutdown_token.clone();
         let handler = self.handler.clone();
         let access = self.access.clone();
@@ -277,181 +276,12 @@ impl<T: RequestHandler> ServerFuture<T> {
     ///               requests within this time period will be closed. In the future it should be
     ///               possible to create long-lived queries, but these should be from trusted sources
     ///               only, this would require some type of whitelisting.
-    /// * `pkcs12` - certificate used to announce to clients
-    #[cfg(all(feature = "dns-over-openssl", not(feature = "dns-over-rustls")))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "dns-over-openssl", not(feature = "dns-over-rustls"))))
-    )]
-    pub fn register_tls_listener(
-        &mut self,
-        listener: net::TcpListener,
-        timeout: Duration,
-        certificate_and_key: ((X509, Option<Stack<X509>>), PKey<Private>),
-    ) -> io::Result<()> {
-        use crate::proto::openssl::{tls_server, TlsStream};
-        use openssl::ssl::Ssl;
-        use std::pin::Pin;
-        use tokio_openssl::SslStream as TokioSslStream;
-
-        let access = self.access.clone();
-        let ((cert, chain), key) = certificate_and_key;
-
-        let handler = self.handler.clone();
-        debug!("registered tcp: {:?}", listener);
-
-        let tls_acceptor = Box::pin(tls_server::new_acceptor(cert, chain, key)?);
-
-        // for each incoming request...
-        let shutdown = self.shutdown_token.clone();
-        self.join_set.spawn(async move {
-            let mut inner_join_set = JoinSet::new();
-            loop {
-                let access = access.clone();
-                let shutdown = shutdown.clone();
-                let (tcp_stream, src_addr) = tokio::select! {
-                    tcp_stream = listener.accept() => match tcp_stream {
-                        Ok((t, s)) => (t, s),
-                        Err(e) => {
-                            debug!("error receiving TLS tcp_stream error: {}", e);
-                            if is_unrecoverable_socket_error(&e) {
-                                break;
-                            }
-                            continue;
-                        },
-                    },
-                    _ = shutdown.cancelled() => {
-                        // A graceful shutdown was initiated. Break out of the loop.
-                        break;
-                    },
-                };
-
-                // verify that the src address is safe for responses
-                if let Err(e) = sanitize_src_address(src_addr) {
-                    warn!(
-                        "address can not be responded to {src_addr}: {e}",
-                        src_addr = src_addr,
-                        e = e
-                    );
-                    continue;
-                }
-
-                let handler = handler.clone();
-                let tls_acceptor = tls_acceptor.clone();
-
-                // kick out to a different task immediately, let them do the TLS handshake
-                inner_join_set.spawn(async move {
-                    debug!("starting TLS request from: {}", src_addr);
-
-                    // perform the TLS
-                    let mut tls_stream = match Ssl::new(tls_acceptor.context())
-                        .and_then(|ssl| TokioSslStream::new(ssl, tcp_stream))
-                    {
-                        Ok(tls_stream) => tls_stream,
-                        Err(e) => {
-                            debug!("tls handshake src: {} error: {}", src_addr, e);
-                            return ();
-                        }
-                    };
-                    match Pin::new(&mut tls_stream).accept().await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            debug!("tls handshake src: {} error: {}", src_addr, e);
-                            return ();
-                        }
-                    };
-                    debug!("accepted TLS request from: {}", src_addr);
-                    let (buf_stream, stream_handle) =
-                        TlsStream::from_stream(AsyncIoTokioAsStd(tls_stream), src_addr);
-                    let mut timeout_stream = TimeoutStream::new(buf_stream, timeout);
-                    while let Some(message) = timeout_stream.next().await {
-                        let message = match message {
-                            Ok(message) => message,
-                            Err(e) => {
-                                debug!(
-                                    "error in TLS request_stream src: {:?} error: {}",
-                                    src_addr, e
-                                );
-
-                                // kill this connection
-                                return ();
-                            }
-                        };
-
-                        self::handle_raw_request(
-                            message,
-                            Protocol::Tls,
-                            access.clone(),
-                            handler.clone(),
-                            stream_handle.clone(),
-                        )
-                        .await;
-                    }
-                });
-
-                reap_tasks(&mut inner_join_set);
-            }
-
-            if shutdown.is_cancelled() {
-                Ok(())
-            } else {
-                Err(ProtoError::from("unexpected close of socket"))
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Register a TlsListener to the Server. The TlsListener should already be bound to either an
-    /// IPv6 or an IPv4 address.
-    ///
-    /// To make the server more resilient to DOS issues, there is a timeout. Care should be taken
-    ///  to not make this too low depending on use cases.
-    ///
-    /// # Arguments
-    /// * `listener` - a bound TCP (needs to be on a different port from standard TCP connections) socket
-    /// * `timeout` - timeout duration of incoming requests, any connection that does not send
-    ///               requests within this time period will be closed. In the future it should be
-    ///               possible to create long-lived queries, but these should be from trusted sources
-    ///               only, this would require some type of whitelisting.
-    /// * `pkcs12` - certificate used to announce to clients
-    #[cfg(all(feature = "dns-over-openssl", not(feature = "dns-over-rustls")))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(feature = "dns-over-openssl", not(feature = "dns-over-rustls"))))
-    )]
-    pub fn register_tls_listener_std(
-        &mut self,
-        listener: std::net::TcpListener,
-        timeout: Duration,
-        certificate_and_key: ((X509, Option<Stack<X509>>), PKey<Private>),
-    ) -> io::Result<()> {
-        self.register_tls_listener(
-            net::TcpListener::from_std(listener)?,
-            timeout,
-            certificate_and_key,
-        )
-    }
-
-    /// Register a TlsListener to the Server. The TlsListener should already be bound to either an
-    /// IPv6 or an IPv4 address.
-    ///
-    /// To make the server more resilient to DOS issues, there is a timeout. Care should be taken
-    ///  to not make this too low depending on use cases.
-    ///
-    /// # Arguments
-    /// * `listener` - a bound TCP (needs to be on a different port from standard TCP connections) socket
-    /// * `timeout` - timeout duration of incoming requests, any connection that does not send
-    ///               requests within this time period will be closed. In the future it should be
-    ///               possible to create long-lived queries, but these should be from trusted sources
-    ///               only, this would require some type of whitelisting.
     /// * `tls_config` - rustls server config
     #[cfg(feature = "dns-over-rustls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dns-over-rustls")))]
     pub fn register_tls_listener_with_tls_config(
         &mut self,
         listener: net::TcpListener,
-        timeout: Duration,
+        handshake_timeout: Duration,
         tls_config: Arc<ServerConfig>,
     ) -> io::Result<()> {
         use crate::proto::rustls::tls_from_stream;
@@ -505,7 +335,12 @@ impl<T: RequestHandler> ServerFuture<T> {
                     debug!("starting TLS request from: {}", src_addr);
 
                     // perform the TLS
-                    let tls_stream = tls_acceptor.accept(tcp_stream).await;
+                    let Ok(tls_stream) =
+                        timeout(handshake_timeout, tls_acceptor.accept(tcp_stream)).await
+                    else {
+                        warn!("tls timeout expired during handshake");
+                        return;
+                    };
 
                     let tls_stream = match tls_stream {
                         Ok(tls_stream) => AsyncIoTokioAsStd(tls_stream),
@@ -516,7 +351,7 @@ impl<T: RequestHandler> ServerFuture<T> {
                     };
                     debug!("accepted TLS request from: {}", src_addr);
                     let (buf_stream, stream_handle) = tls_from_stream(tls_stream, src_addr);
-                    let mut timeout_stream = TimeoutStream::new(buf_stream, timeout);
+                    let mut timeout_stream = TimeoutStream::new(buf_stream, handshake_timeout);
                     while let Some(message) = timeout_stream.next().await {
                         let message = match message {
                             Ok(message) => message,
@@ -569,24 +404,14 @@ impl<T: RequestHandler> ServerFuture<T> {
     ///               only, this would require some type of whitelisting.
     /// * `pkcs12` - certificate used to announce to clients
     #[cfg(feature = "dns-over-rustls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dns-over-rustls")))]
     pub fn register_tls_listener(
         &mut self,
         listener: net::TcpListener,
         timeout: Duration,
         certificate_and_key: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
     ) -> io::Result<()> {
-        use crate::proto::rustls::tls_server;
-
-        let tls_acceptor = tls_server::new_acceptor(certificate_and_key.0, certificate_and_key.1)
-            .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("error creating TLS acceptor: {e}"),
-            )
-        })?;
-
-        Self::register_tls_listener_with_tls_config(self, listener, timeout, Arc::new(tls_acceptor))
+        let config = tls_server_config(b"dot", certificate_and_key.0, certificate_and_key.1)?;
+        Self::register_tls_listener_with_tls_config(self, listener, timeout, Arc::new(config))
     }
 
     /// Register a TcpListener for HTTPS (h2) to the Server for supporting DoH (dns-over-https). The TcpListener should already be bound to either an
@@ -603,34 +428,30 @@ impl<T: RequestHandler> ServerFuture<T> {
     ///               only, this would require some type of whitelisting.
     /// * `certificate_and_key` - certificate and key used to announce to clients
     #[cfg(feature = "dns-over-https-rustls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dns-over-https-rustls")))]
     pub fn register_https_listener(
         &mut self,
         listener: net::TcpListener,
         // TODO: need to set a timeout between requests.
-        _timeout: Duration,
+        handshake_timeout: Duration,
         certificate_and_key: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
         dns_hostname: Option<String>,
+        http_endpoint: String,
     ) -> io::Result<()> {
+        use crate::server::h2_handler::h2_handler;
         use tokio_rustls::TlsAcceptor;
 
-        use crate::proto::rustls::tls_server;
-        use crate::server::h2_handler::h2_handler;
-
         let dns_hostname: Option<Arc<str>> = dns_hostname.map(|n| n.into());
+        let http_endpoint: Arc<str> = Arc::from(http_endpoint);
 
         let handler = self.handler.clone();
         let access = self.access.clone();
         debug!("registered https: {listener:?}");
 
-        let tls_acceptor = tls_server::new_acceptor(certificate_and_key.0, certificate_and_key.1)
-            .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("error creating TLS acceptor: {e}"),
-            )
-        })?;
-        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_acceptor));
+        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_server_config(
+            b"h2",
+            certificate_and_key.0,
+            certificate_and_key.1,
+        )?));
 
         // for each incoming request...
         let shutdown = self.shutdown_token.clone();
@@ -665,13 +486,19 @@ impl<T: RequestHandler> ServerFuture<T> {
                 let access = access.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let dns_hostname = dns_hostname.clone();
+                let http_endpoint = http_endpoint.clone();
 
                 inner_join_set.spawn(async move {
                     debug!("starting HTTPS request from: {src_addr}");
 
                     // TODO: need to consider timeout of total connect...
                     // take the created stream...
-                    let tls_stream = tls_acceptor.accept(tcp_stream).await;
+                    let Ok(tls_stream) =
+                        timeout(handshake_timeout, tls_acceptor.accept(tcp_stream)).await
+                    else {
+                        warn!("https timeout expired during handshake");
+                        return;
+                    };
 
                     let tls_stream = match tls_stream {
                         Ok(tls_stream) => tls_stream,
@@ -688,6 +515,7 @@ impl<T: RequestHandler> ServerFuture<T> {
                         tls_stream,
                         src_addr,
                         dns_hostname,
+                        http_endpoint,
                         shutdown.clone(),
                     )
                     .await;
@@ -720,7 +548,6 @@ impl<T: RequestHandler> ServerFuture<T> {
     ///               only, this would require some type of whitelisting.
     /// * `pkcs12` - certificate used to announce to clients
     #[cfg(feature = "dns-over-quic")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dns-over-quic")))]
     pub fn register_quic_listener(
         &mut self,
         socket: net::UdpSocket,
@@ -819,7 +646,6 @@ impl<T: RequestHandler> ServerFuture<T> {
     ///               only, this would require some type of whitelisting.
     /// * `pkcs12` - certificate used to announce to clients
     #[cfg(feature = "dns-over-h3")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dns-over-h3")))]
     pub fn register_h3_listener(
         &mut self,
         socket: net::UdpSocket,
@@ -976,6 +802,34 @@ pub(crate) async fn handle_raw_request<T: RequestHandler>(
     .await;
 }
 
+#[cfg(feature = "dns-over-rustls")]
+fn tls_server_config(
+    protocol: &[u8],
+    cert: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, io::Error> {
+    let mut config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("error creating TLS acceptor: {e}"),
+                )
+            })?
+            .with_no_client_auth()
+            .with_single_cert(cert, key)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("error creating TLS acceptor: {e}"),
+                )
+            })?;
+
+    config.alpn_protocols = vec![protocol.to_vec()];
+    Ok(config)
+}
+
 #[derive(Clone)]
 struct ReportingResponseHandler<R: ResponseHandler> {
     request_header: Header,
@@ -1057,7 +911,7 @@ pub(crate) async fn handle_request<R: ResponseHandler, T: RequestHandler>(
         let qflags = message.header().flags();
         let qop_code = message.op_code();
         let message_type = message.message_type();
-        let is_dnssec = message.edns().map_or(false, Edns::dnssec_ok);
+        let is_dnssec = message.edns().is_some_and(|edns| edns.flags().dnssec_ok);
 
         let request = Request::new(message, src_addr, protocol);
 
@@ -1375,6 +1229,7 @@ mod tests {
                         Duration::from_secs(1),
                         cert_key,
                         None,
+                        "/dns-query".into(),
                     )
                     .unwrap();
             }
@@ -1424,25 +1279,20 @@ mod tests {
 
     #[cfg(feature = "dns-over-rustls")]
     fn rustls_cert_key() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        use hickory_proto::rustls::tls_server;
+        use rustls::pki_types::pem::PemObject;
         use std::env;
-        use std::path::Path;
 
         let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "../..".to_owned());
+        let cert_chain =
+            CertificateDer::pem_file_iter(format!("{}/tests/test-data/cert.pem", server_path))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
 
-        let cert = tls_server::read_cert(Path::new(&format!(
-            "{}/tests/test-data/cert.pem",
-            server_path
-        )))
-        .map_err(|e| format!("error reading cert: {e}"))
-        .unwrap();
-        let key = tls_server::read_key(Path::new(&format!(
-            "{}/tests/test-data/cert.key",
-            server_path
-        )))
-        .unwrap();
+        let key = PrivateKeyDer::from_pem_file(format!("{server_path}/tests/test-data/cert.key"))
+            .unwrap();
 
-        (cert, key)
+        (cert_chain, key)
     }
 
     #[test]

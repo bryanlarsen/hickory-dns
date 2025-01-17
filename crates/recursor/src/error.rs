@@ -9,18 +9,20 @@
 
 #![deny(missing_docs)]
 
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 
-use crate::proto::error::ForwardNSData;
 use enum_as_inner::EnumAsInner;
-use hickory_proto::error::ProtoErrorKind;
-use hickory_resolver::Name;
 use thiserror::Error;
+use tracing::warn;
 
-use crate::proto::rr::{rdata::SOA, Record};
+use crate::proto::{
+    op::ResponseCode,
+    rr::{rdata::SOA, Name, Record},
+    ForwardNSData, ProtoErrorKind, {ForwardData, ProtoError},
+};
 #[cfg(feature = "backtrace")]
 use crate::proto::{trace, ExtBacktrace};
-use crate::{proto::error::ProtoError, resolver::error::ResolveError};
+use crate::resolver::ResolveError;
 
 /// The error kind for errors that get returned in the crate
 #[derive(Debug, EnumAsInner, Error)]
@@ -35,13 +37,13 @@ pub enum ErrorKind {
     Msg(String),
 
     /// Upstream DNS authority returned a Referral to another nameserver in the form of an SOA record
-    #[error("forward response: {0}")]
-    Forward(Name),
+    #[error("forward response")]
+    Forward(ForwardData),
 
     /// Upstream DNS authority returned a referral to another set of nameservers in the form of
     /// additional NS records.
     #[error("forward NS Response")]
-    ForwardNS(Vec<ForwardNSData>),
+    ForwardNS(Arc<[ForwardNSData]>),
 
     /// An error got returned from IO
     #[error("io error: {0}")]
@@ -58,13 +60,20 @@ pub enum ErrorKind {
     /// A request timed out
     #[error("request timed out")]
     Timeout,
+
+    /// Could not fetch all records because a recursion limit was exceeded
+    #[error("maximum recursion limit exceeded: {count} queries")]
+    RecursionLimitExceeded {
+        /// Number of queries that were made
+        count: usize,
+    },
 }
 
 /// The error type for errors that get returned in the crate
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
 pub struct Error {
-    /// Kind of error that ocurred
+    /// Kind of error that occurred
     pub kind: Box<ErrorKind>,
     /// Backtrace to the source of the error
     #[cfg(feature = "backtrace")]
@@ -77,11 +86,17 @@ impl Error {
         &self.kind
     }
 
+    /// Take kind from the Error
+    pub fn into_kind(self) -> ErrorKind {
+        *self.kind
+    }
+
     /// Returns true if the domain does not exist
     pub fn is_nx_domain(&self) -> bool {
         match &*self.kind {
             ErrorKind::Proto(proto) => proto.is_nx_domain(),
             ErrorKind::Resolve(err) => err.is_nx_domain(),
+            ErrorKind::Forward(fwd) => fwd.is_nx_domain(),
             _ => false,
         }
     }
@@ -91,6 +106,7 @@ impl Error {
         match &*self.kind {
             ErrorKind::Proto(proto) => proto.is_no_records_found(),
             ErrorKind::Resolve(err) => err.is_no_records_found(),
+            ErrorKind::Forward(fwd) => fwd.is_no_records_found(),
             _ => false,
         }
     }
@@ -100,8 +116,31 @@ impl Error {
         match *self.kind {
             ErrorKind::Proto(proto) => proto.into_soa(),
             ErrorKind::Resolve(err) => err.into_soa(),
+            ErrorKind::Forward(fwd) => Some(fwd.soa),
             _ => None,
         }
+    }
+
+    /// Return additional records
+    pub fn authorities(self) -> Option<Arc<[Record]>> {
+        match *self.kind {
+            ErrorKind::Forward(fwd) => fwd.authorities,
+            _ => None,
+        }
+    }
+
+    /// Test if the recursion depth has been exceeded, and return an error if it has.
+    pub fn recursion_exceeded(limit: Option<u8>, depth: u8, name: &Name) -> Result<(), Error> {
+        match limit {
+            Some(limit) if depth > limit => {}
+            _ => return Ok(()),
+        }
+
+        warn!("recursion depth exceeded for {name}");
+        Err(ErrorKind::RecursionLimitExceeded {
+            count: depth as usize,
+        }
+        .into())
     }
 }
 
@@ -109,7 +148,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cfg_if::cfg_if! {
             if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
+                if let Some(backtrace) = &self.backtrack {
                     fmt::Display::fmt(&self.kind, f)?;
                     fmt::Debug::fmt(backtrace, f)
                 } else {
@@ -151,7 +190,7 @@ impl From<String> for Error {
 
 impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
-        match *e.kind() {
+        match e.kind() {
             ErrorKind::Timeout => Self::new(io::ErrorKind::TimedOut, e),
             _ => Self::new(io::ErrorKind::Other, e),
         }
@@ -166,18 +205,39 @@ impl From<Error> for String {
 
 impl From<ResolveError> for Error {
     fn from(e: ResolveError) -> Self {
-        if let Some(ProtoErrorKind::NoRecordsFound { soa, ns, .. }) =
-            e.proto().map(ProtoError::kind)
-        {
-            if let Some(ns) = ns {
-                ErrorKind::ForwardNS(ns.clone()).into()
-            } else if let Some(soa) = soa {
-                ErrorKind::Forward(soa.name().clone()).into()
-            } else {
-                ErrorKind::Resolve(e).into()
-            }
+        let nx_domain = e.is_nx_domain();
+        let no_records_found = e.is_no_records_found();
+
+        let proto_err = match ProtoErrorKind::try_from(e) {
+            Ok(res) => res,
+            Err(e) => return ErrorKind::Resolve(e).into(),
+        };
+
+        let ProtoErrorKind::NoRecordsFound {
+            query,
+            soa,
+            ns,
+            authorities,
+            ..
+        } = proto_err
+        else {
+            return ErrorKind::Proto(proto_err.into()).into();
+        };
+
+        if let Some(ns) = ns {
+            ErrorKind::ForwardNS(ns).into()
+        } else if let Some(soa) = soa {
+            ErrorKind::Forward(ForwardData::new(
+                query,
+                soa.name().clone(),
+                soa,
+                no_records_found,
+                nx_domain,
+                authorities,
+            ))
+            .into()
         } else {
-            ErrorKind::Resolve(e).into()
+            ErrorKind::Message("proto error missing ns and soa").into()
         }
     }
 }
@@ -185,21 +245,38 @@ impl From<ResolveError> for Error {
 impl Clone for ErrorKind {
     fn clone(&self) -> Self {
         use self::ErrorKind::*;
-        match *self {
+        match self {
             Message(msg) => Message(msg),
-            Msg(ref msg) => Msg(msg.clone()),
-            Forward(ref ns) => Forward(ns.clone()),
-            ForwardNS(ref ns) => ForwardNS(ns.clone()),
-            Io(ref io) => Io(std::io::Error::from(io.kind())),
-            Proto(ref proto) => Proto(proto.clone()),
-            Resolve(ref resolve) => Resolve(resolve.clone()),
+            Msg(msg) => Msg(msg.clone()),
+            Forward(ns) => Forward(ns.clone()),
+            ForwardNS(ns) => ForwardNS(ns.clone()),
+            Io(io) => Io(std::io::Error::from(io.kind())),
+            Proto(proto) => Proto(proto.clone()),
+            Resolve(resolve) => Resolve(resolve.clone()),
             Timeout => Self::Timeout,
+            RecursionLimitExceeded { count } => RecursionLimitExceeded { count: *count },
         }
     }
 }
 
-/// A trait marking a type which implements `From<Error>` and
-/// std::error::Error types as well as Clone + Send
-pub trait FromError: From<Error> + std::error::Error + Clone {}
-
-impl<E> FromError for E where E: From<Error> + std::error::Error + Clone {}
+impl From<Error> for ProtoError {
+    fn from(e: Error) -> Self {
+        let is_nx_domain = e.is_nx_domain();
+        match *e.kind {
+            ErrorKind::Forward(fwd) => ProtoError::nx_error(
+                fwd.query,
+                Some(fwd.soa),
+                None,
+                None,
+                if is_nx_domain {
+                    ResponseCode::NXDomain
+                } else {
+                    ResponseCode::NoError
+                },
+                true,
+                fwd.authorities,
+            ),
+            _ => ProtoError::from(e.to_string()),
+        }
+    }
+}

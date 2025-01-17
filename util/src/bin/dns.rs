@@ -29,17 +29,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified},
     pki_types::{CertificateDer, ServerName, UnixTime},
-    ClientConfig, DigitallySignedStruct, RootCertStore,
+    ClientConfig, DigitallySignedStruct,
 };
-use tokio::net::{TcpStream as TokioTcpStream, UdpSocket};
 use tracing::Level;
 
-use hickory_client::client::{AsyncClient, ClientHandle};
+use hickory_client::client::{Client, ClientHandle};
+#[cfg(any(feature = "dns-over-rustls", feature = "dns-over-https-rustls"))]
+use hickory_proto::rustls::client_config;
 #[cfg(feature = "dns-over-rustls")]
 use hickory_proto::rustls::tls_client_connect;
 use hickory_proto::{
-    iocompat::AsyncIoTokioAsStd,
     rr::{DNSClass, Name, RData, RecordSet, RecordType},
+    runtime::{RuntimeProvider, TokioRuntimeProvider},
     serialize::txt::RDataParser,
     tcp::TcpClientStream,
     udp::UdpClientStream,
@@ -63,6 +64,10 @@ struct Opts {
     /// TLS endpoint name, i.e. the name in the certificate presented by the remote server
     #[clap(short = 't', long, required_if_eq_any = [("protocol", "tls"), ("protocol", "https"), ("protocol", "quic")])]
     tls_dns_name: Option<String>,
+
+    /// HTTP endpoint path. Relevant only to DNS-over-HTTPS. Defaults to `/dns-query`.
+    #[clap(short = 'e', long, default_value = "/dns-query")]
+    http_endpoint: Option<String>,
 
     /// For TLS, HTTPS, QUIC and H3 a custom ALPN code can be supplied
     ///
@@ -234,11 +239,12 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hickory_util::logger(env!("CARGO_BIN_NAME"), log_level);
 
     // TODO: need to cleanup all of ClientHandle and the Client in general to make it dynamically usable.
+    let provider = TokioRuntimeProvider::new();
     match opts.protocol {
-        Protocol::Udp => udp(opts).await?,
-        Protocol::Tcp => tcp(opts).await?,
-        Protocol::Tls => tls(opts).await?,
-        Protocol::Https => https(opts).await?,
+        Protocol::Udp => udp(opts, provider).await?,
+        Protocol::Tcp => tcp(opts, provider).await?,
+        Protocol::Tls => tls(opts, provider).await?,
+        Protocol::Https => https(opts, provider).await?,
         Protocol::Quic => quic(opts).await?,
         Protocol::H3 => h3(opts).await?,
     };
@@ -246,12 +252,12 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn udp(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn udp(opts: Opts, provider: impl RuntimeProvider) -> Result<(), Box<dyn std::error::Error>> {
     let nameserver = opts.nameserver;
 
     println!("; using udp:{nameserver}");
-    let stream = UdpClientStream::<UdpSocket>::new(nameserver);
-    let (client, bg) = AsyncClient::connect(stream).await?;
+    let stream = UdpClientStream::builder(nameserver, provider).build();
+    let (client, bg) = Client::connect(stream).await?;
     let handle = tokio::spawn(bg);
     handle_request(opts.class, opts.zone, opts.command, client).await?;
     drop(handle);
@@ -259,12 +265,12 @@ async fn udp(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn tcp(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn tcp(opts: Opts, provider: impl RuntimeProvider) -> Result<(), Box<dyn std::error::Error>> {
     let nameserver = opts.nameserver;
 
     println!("; using tcp:{nameserver}");
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(nameserver);
-    let client = AsyncClient::new(stream, sender, None);
+    let (stream, sender) = TcpClientStream::new(nameserver, None, None, provider);
+    let client = Client::new(stream, sender, None);
     let (client, bg) = client.await?;
 
     let handle = tokio::spawn(bg);
@@ -275,12 +281,15 @@ async fn tcp(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(feature = "dns-over-rustls"))]
-async fn tls(_opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn tls(
+    _opts: Opts,
+    _provider: impl RuntimeProvider,
+) -> Result<(), Box<dyn std::error::Error>> {
     panic!("`dns-over-rustls` feature is required during compilation");
 }
 
 #[cfg(feature = "dns-over-rustls")]
-async fn tls(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn tls(opts: Opts, provider: impl RuntimeProvider) -> Result<(), Box<dyn std::error::Error>> {
     let nameserver = opts.nameserver;
     let alpn = opts.alpn.map(String::into_bytes);
     let dns_name = opts
@@ -288,7 +297,7 @@ async fn tls(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
         .expect("tls_dns_name is required tls connections");
     println!("; using tls:{nameserver} dns_name:{dns_name}");
 
-    let mut config = tls_config()?;
+    let mut config = client_config()?;
     if opts.do_not_verify_nameserver_cert {
         self::do_not_verify_nameserver_cert(&mut config);
     }
@@ -297,9 +306,8 @@ async fn tls(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Arc::new(config);
-    let (stream, sender) =
-        tls_client_connect::<AsyncIoTokioAsStd<TokioTcpStream>>(nameserver, dns_name, config);
-    let (client, bg) = AsyncClient::new(stream, sender, None).await?;
+    let (stream, sender) = tls_client_connect(nameserver, dns_name, config, provider);
+    let (client, bg) = Client::new(stream, sender, None).await?;
 
     let handle = tokio::spawn(bg);
     handle_request(opts.class, opts.zone, opts.command, client).await?;
@@ -309,12 +317,18 @@ async fn tls(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(not(feature = "dns-over-https-rustls"))]
-async fn https(_opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
-    panic!("`dns-over-https` feature is required during compilation");
+async fn https(
+    _opts: Opts,
+    _provider: impl RuntimeProvider,
+) -> Result<(), Box<dyn std::error::Error>> {
+    panic!("`dns-over-https-rustls` feature is required during compilation");
 }
 
 #[cfg(feature = "dns-over-https-rustls")]
-async fn https(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn https(
+    opts: Opts,
+    provider: impl RuntimeProvider,
+) -> Result<(), Box<dyn std::error::Error>> {
     use hickory_proto::h2::HttpsClientStreamBuilder;
 
     let nameserver = opts.nameserver;
@@ -324,21 +338,22 @@ async fn https(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
         .expect("ALPN is required for HTTPS");
     let dns_name = opts
         .tls_dns_name
-        .expect("tls_dns_name is required https connections");
+        .expect("tls_dns_name is required for https connections");
+    let http_endpoint = opts
+        .http_endpoint
+        .expect("http_endpoint is required for https connections");
     println!("; using https:{nameserver} dns_name:{dns_name}");
 
-    let mut config = tls_config()?;
+    let mut config = client_config()?;
     if opts.do_not_verify_nameserver_cert {
         self::do_not_verify_nameserver_cert(&mut config);
     }
     config.alpn_protocols.push(alpn);
     let config = Arc::new(config);
 
-    let https_builder = HttpsClientStreamBuilder::with_client_config(config);
-    let (client, bg) = AsyncClient::connect(
-        https_builder.build::<AsyncIoTokioAsStd<TokioTcpStream>>(nameserver, dns_name),
-    )
-    .await?;
+    let https_builder = HttpsClientStreamBuilder::with_client_config(config, provider);
+    let (client, bg) =
+        Client::connect(https_builder.build(nameserver, dns_name, http_endpoint)).await?;
 
     let handle = tokio::spawn(bg);
     handle_request(opts.class, opts.zone, opts.command, client).await?;
@@ -354,7 +369,7 @@ async fn quic(_opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "dns-over-quic")]
 async fn quic(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
-    use hickory_proto::quic::{self, QuicClientStream};
+    use hickory_proto::quic::QuicClientStream;
 
     let nameserver = opts.nameserver;
     let alpn = opts
@@ -366,7 +381,7 @@ async fn quic(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
         .expect("tls_dns_name is required quic connections");
     println!("; using quic:{nameserver} dns_name:{dns_name}");
 
-    let mut config = quic::client_config_tls13()?;
+    let mut config = client_config()?;
     if opts.do_not_verify_nameserver_cert {
         self::do_not_verify_nameserver_cert(&mut config);
     }
@@ -374,7 +389,7 @@ async fn quic(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut quic_builder = QuicClientStream::builder();
     quic_builder.crypto_config(config);
-    let (client, bg) = AsyncClient::connect(quic_builder.build(nameserver, dns_name)).await?;
+    let (client, bg) = Client::connect(quic_builder.build(nameserver, dns_name)).await?;
 
     let handle = tokio::spawn(bg);
     handle_request(opts.class, opts.zone, opts.command, client).await?;
@@ -390,7 +405,7 @@ async fn h3(_opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "dns-over-h3")]
 async fn h3(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
-    use hickory_proto::h3::{self, H3ClientStream};
+    use hickory_proto::h3::H3ClientStream;
 
     let nameserver = opts.nameserver;
     let alpn = opts
@@ -399,10 +414,13 @@ async fn h3(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
         .expect("ALPN is required for H3");
     let dns_name = opts
         .tls_dns_name
-        .expect("tls_dns_name is required H3 connections");
+        .expect("tls_dns_name is required for H3 connections");
+    let http_endpoint = opts
+        .http_endpoint
+        .expect("http_endpoint is required for H3 connections");
     println!("; using h3:{nameserver} dns_name:{dns_name}");
 
-    let mut config = h3::client_config_tls13()?;
+    let mut config = client_config()?;
     if opts.do_not_verify_nameserver_cert {
         self::do_not_verify_nameserver_cert(&mut config);
     }
@@ -410,7 +428,8 @@ async fn h3(opts: Opts) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut h3_builder = H3ClientStream::builder();
     h3_builder.crypto_config(config);
-    let (client, bg) = AsyncClient::connect(h3_builder.build(nameserver, dns_name)).await?;
+    let (client, bg) =
+        Client::connect(h3_builder.build(nameserver, dns_name, http_endpoint)).await?;
 
     let handle = tokio::spawn(bg);
     handle_request(opts.class, opts.zone, opts.command, client).await?;
@@ -513,43 +532,6 @@ fn record_set_from(
     }
 
     record_set
-}
-
-#[cfg(feature = "dns-over-rustls")]
-fn tls_config() -> Result<ClientConfig, Box<dyn std::error::Error>> {
-    #[cfg_attr(
-        not(any(feature = "native-certs", feature = "webpki-roots")),
-        allow(unused_mut)
-    )]
-    let mut root_store = RootCertStore::empty();
-    #[cfg(all(feature = "native-certs", not(feature = "webpki-roots")))]
-    {
-        use hickory_proto::error::ProtoErrorKind;
-
-        let (added, ignored) =
-            root_store.add_parsable_certificates(&rustls_native_certs::load_native_certs()?);
-
-        if ignored > 0 {
-            tracing::warn!(
-                "failed to parse {} certificate(s) from the native root store",
-                ignored,
-            );
-        }
-
-        if added == 0 {
-            return Err(ProtoErrorKind::NativeCerts.into());
-        }
-    }
-    #[cfg(feature = "webpki-roots")]
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    Ok(
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
 }
 
 #[cfg(feature = "dns-over-rustls")]

@@ -7,11 +7,14 @@
 
 use std::io;
 
-use hickory_resolver::{config::ResolveHosts, name_server::TokioConnectionProvider};
+use hickory_resolver::{
+    config::ResolveHosts,
+    name_server::{ConnectionProvider, TokioConnectionProvider},
+};
 use tracing::{debug, info};
 
-#[cfg(feature = "dnssec")]
-use crate::{authority::Nsec3QueryInfo, config::dnssec::NxProofKind};
+#[cfg(feature = "dnssec-ring")]
+use crate::{authority::Nsec3QueryInfo, dnssec::NxProofKind};
 use crate::{
     authority::{
         Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions, MessageRequest,
@@ -21,25 +24,23 @@ use crate::{
         op::ResponseCode,
         rr::{LowerName, Name, Record, RecordType},
     },
-    resolver::{config::ResolverConfig, lookup::Lookup as ResolverLookup, TokioAsyncResolver},
+    resolver::{config::ResolverConfig, lookup::Lookup as ResolverLookup, Resolver},
     server::RequestInfo,
     store::forwarder::ForwardConfig,
 };
 
 /// An authority that will forward resolutions to upstream resolvers.
 ///
-/// This uses the hickory-resolver for resolving requests.
-pub struct ForwardAuthority {
+/// This uses the hickory-resolver crate for resolving requests.
+pub struct ForwardAuthority<P: ConnectionProvider = TokioConnectionProvider> {
     origin: LowerName,
-    resolver: TokioAsyncResolver,
+    resolver: Resolver<P>,
 }
 
-impl ForwardAuthority {
-    /// TODO: change this name to create or something
-    #[allow(clippy::new_without_default)]
+impl<P: ConnectionProvider> ForwardAuthority<P> {
     #[doc(hidden)]
-    pub fn new(runtime: TokioConnectionProvider) -> Result<Self, String> {
-        let resolver = TokioAsyncResolver::from_system_conf(runtime)
+    pub fn new(runtime: P) -> Result<Self, String> {
+        let resolver = Resolver::from_system_conf(runtime)
             .map_err(|e| format!("error constructing new Resolver: {e}"))?;
 
         Ok(Self {
@@ -49,10 +50,11 @@ impl ForwardAuthority {
     }
 
     /// Read the Authority for the origin from the specified configuration
-    pub fn try_from_config(
+    pub fn try_from_runtime(
         origin: Name,
         _zone_type: ZoneType,
         config: &ForwardConfig,
+        runtime: P,
     ) -> Result<Self, String> {
         info!("loading forwarder config: {}", origin);
 
@@ -86,7 +88,7 @@ impl ForwardAuthority {
 
         let config = ResolverConfig::from_parts(None, vec![], name_servers);
 
-        let resolver = TokioAsyncResolver::new(config, options, TokioConnectionProvider::default());
+        let resolver = Resolver::new(config, options, runtime);
 
         info!("forward resolver configured: {}: ", origin);
 
@@ -98,13 +100,29 @@ impl ForwardAuthority {
     }
 }
 
+impl ForwardAuthority<TokioConnectionProvider> {
+    /// Read the Authority for the origin from the specified configuration
+    pub fn try_from_config(
+        origin: Name,
+        zone_type: ZoneType,
+        config: &ForwardConfig,
+    ) -> Result<Self, String> {
+        Self::try_from_runtime(
+            origin,
+            zone_type,
+            config,
+            TokioConnectionProvider::default(),
+        )
+    }
+}
+
 #[async_trait::async_trait]
-impl Authority for ForwardAuthority {
+impl<P: ConnectionProvider> Authority for ForwardAuthority<P> {
     type Lookup = ForwardLookup;
 
-    /// Always Forward
+    /// Always External
     fn zone_type(&self) -> ZoneType {
-        ZoneType::Forward
+        ZoneType::External
     }
 
     /// Always false for Forward zones
@@ -173,7 +191,7 @@ impl Authority for ForwardAuthority {
         ))))
     }
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     async fn get_nsec3_records(
         &self,
         _info: Nsec3QueryInfo<'_>,
@@ -185,7 +203,7 @@ impl Authority for ForwardAuthority {
         ))))
     }
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     fn nx_proof_kind(&self) -> Option<&NxProofKind> {
         None
     }

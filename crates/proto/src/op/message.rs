@@ -7,8 +7,10 @@
 
 //! Basic protocol message for DNS
 
-use std::{fmt, iter, mem, ops::Deref, sync::Arc};
+use std::{fmt, iter, mem, ops::Deref};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
@@ -62,6 +64,7 @@ use crate::{
 /// By default Message is a Query. Use the Message::as_update() to create and update, or
 ///  Message::new_update()
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Message {
     header: Header,
     queries: Vec<Query>,
@@ -383,8 +386,7 @@ impl Message {
     /// Add a SIG0 record, i.e. sign this message
     ///
     /// This must be used only after all records have been associated. Generally this will be handled by the client and not need to be used directly
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     pub fn add_sig0(&mut self, record: Record) -> &mut Self {
         assert_eq!(RecordType::SIG, record.record_type());
         self.signature.push(record);
@@ -394,8 +396,7 @@ impl Message {
     /// Add a TSIG record, i.e. authenticate this message
     ///
     /// This must be used only after all records have been associated. Generally this will be handled by the client and not need to be used directly
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     pub fn add_tsig(&mut self, record: Record) -> &mut Self {
         assert_eq!(RecordType::TSIG, record.record_type());
         self.signature.push(record);
@@ -696,7 +697,7 @@ impl Message {
     /// # Returns
     ///
     /// This returns a tuple of first standard Records, then a possibly associated Edns, and then finally any optionally associated SIG0 and TSIG records.
-    #[cfg_attr(not(feature = "dnssec"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "dnssec-ring"), allow(unused_mut))]
     pub fn read_records(
         decoder: &mut BinDecoder<'_>,
         count: usize,
@@ -722,12 +723,12 @@ impl Message {
                 records.push(record)
             } else {
                 match record.record_type() {
-                    #[cfg(feature = "dnssec")]
+                    #[cfg(feature = "dnssec-ring")]
                     RecordType::SIG => {
                         saw_sig0 = true;
                         sigs.push(record);
                     }
-                    #[cfg(feature = "dnssec")]
+                    #[cfg(feature = "dnssec-ring")]
                     RecordType::TSIG => {
                         if saw_sig0 {
                             return Err("sig0 must be final resource record".into());
@@ -781,9 +782,9 @@ impl Message {
     ///
     /// Subsequent to calling this, the Message should not change.
     #[allow(clippy::match_single_binding)]
-    pub fn finalize<MF: MessageFinalizer>(
+    pub fn finalize(
         &mut self,
-        finalizer: &MF,
+        finalizer: &dyn MessageFinalizer,
         inception_time: u32,
     ) -> ProtoResult<Option<MessageVerifier>> {
         debug!("finalizing message: {:?}", self);
@@ -794,9 +795,9 @@ impl Message {
         for fin in finals {
             match fin.record_type() {
                 // SIG0's are special, and come at the very end of the message
-                #[cfg(feature = "dnssec")]
+                #[cfg(feature = "dnssec-ring")]
                 RecordType::SIG => self.add_sig0(fin),
-                #[cfg(feature = "dnssec")]
+                #[cfg(feature = "dnssec-ring")]
                 RecordType::TSIG => self.add_tsig(fin),
                 _ => self.add_additional(fin),
             };
@@ -926,33 +927,6 @@ pub trait MessageFinalizer: Send + Sync + 'static {
                 .queries()
                 .iter()
                 .any(|q| [RecordType::AXFR, RecordType::IXFR].contains(&q.query_type()))
-    }
-}
-
-/// A MessageFinalizer which does nothing
-///
-/// *WARNING* This should only be used in None context, it will panic in all cases where finalize is called.
-#[derive(Clone, Copy, Debug)]
-pub struct NoopMessageFinalizer;
-
-impl NoopMessageFinalizer {
-    /// Always returns None
-    pub fn new() -> Option<Arc<Self>> {
-        None
-    }
-}
-
-impl MessageFinalizer for NoopMessageFinalizer {
-    fn finalize_message(
-        &self,
-        _: &Message,
-        _: u32,
-    ) -> ProtoResult<(Vec<Record>, Option<MessageVerifier>)> {
-        panic!("Misused NoopMessageFinalizer, None should be used instead")
-    }
-
-    fn should_finalize_message(&self, _: &Message) -> bool {
-        true
     }
 }
 
@@ -1287,7 +1261,7 @@ mod tests {
             b'm', b'p', b'l', b'e', //
             0x03, b'c', b'o', b'm', //
             0x00,                   // 0 = endname
-            0x00, 0x01, 0x00, 0x01, // ReordType = A, Class = IN
+            0x00, 0x01, 0x00, 0x01, // RecordType = A, Class = IN
             0xC0, 0x0C,             // name pointer to www.example.com
             0x00, 0x01, 0x00, 0x01, // RecordType = A, Class = IN
             0x00, 0x00, 0x00, 0x02, // TTL = 2 seconds

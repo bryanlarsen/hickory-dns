@@ -7,23 +7,24 @@
 
 //! This module contains all the types for demuxing DNS oriented streams.
 
+use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_channel::mpsc;
-use futures_util::future::{Future, FutureExt};
+use futures_util::future::FutureExt;
 use futures_util::stream::{Peekable, Stream, StreamExt};
 use tracing::{debug, warn};
 
 use crate::error::*;
+use crate::runtime::Time;
 use crate::xfer::dns_handle::DnsHandle;
 use crate::xfer::DnsResponseReceiver;
 use crate::xfer::{
     BufDnsRequestStreamHandle, DnsRequest, DnsRequestSender, DnsResponse, OneshotDnsRequest,
     CHANNEL_BUFFER_SIZE,
 };
-use crate::Time;
 
 /// This is a generic Exchange implemented over multiplexed DNS connection providers.
 ///
@@ -311,11 +312,11 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             let next;
-            match *self {
+            match &mut *self {
                 Self::Connecting {
-                    ref mut connect_future,
-                    ref mut outbound_messages,
-                    ref mut sender,
+                    connect_future,
+                    outbound_messages,
+                    sender,
                 } => {
                     let connect_future = Pin::new(connect_future);
                     match connect_future.poll(cx) {
@@ -348,8 +349,8 @@ where
                     };
                 }
                 Self::Connected {
-                    ref exchange,
-                    ref mut background,
+                    exchange,
+                    background,
                 } => {
                     let exchange = exchange.clone();
                     let background = background.take().expect("cannot poll after complete");
@@ -357,8 +358,8 @@ where
                     return Poll::Ready(Ok((exchange, background)));
                 }
                 Self::FailAll {
-                    ref error,
-                    ref mut outbound_messages,
+                    error,
+                    outbound_messages,
                 } => {
                     while let Some(outbound_message) = match outbound_messages.poll_next_unpin(cx) {
                         Poll::Ready(opt) => opt,
@@ -374,7 +375,7 @@ where
 
                     return Poll::Ready(Err(error.clone()));
                 }
-                Self::Error(ref error) => return Poll::Ready(Err(error.clone())),
+                Self::Error(error) => return Poll::Ready(Err(error.clone())),
             }
 
             *self = next;

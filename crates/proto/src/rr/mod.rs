@@ -9,9 +9,6 @@
 
 pub mod dns_class;
 // TODO: rename to sec
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
-pub mod dnssec;
 pub mod domain;
 mod lower_name;
 pub mod rdata;
@@ -31,7 +28,7 @@ use crate::{
 };
 
 pub use self::dns_class::DNSClass;
-pub use self::domain::{IntoName, Name, TryParseIp};
+pub use self::domain::{IntoName, Name};
 pub use self::record_data::RData;
 pub use self::record_type::RecordType;
 pub use self::resource::Record;
@@ -66,7 +63,7 @@ pub trait RecordData: Clone + Sized + PartialEq + Eq + Display + Debug + BinEnco
     }
 }
 
-trait RecordDataDecodable<'r>: Sized {
+pub(crate) trait RecordDataDecodable<'r>: Sized {
     /// Read the RecordData from the data stream.
     ///
     /// * `decoder` - data stream from which the RData will be read

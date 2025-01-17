@@ -35,23 +35,15 @@ name = "hickory_integration"
 path = "src/lib.rs"
 
 [features]
-dnssec-openssl = [
-    "dnssec",
-    "hickory-resolver/dnssec-openssl",
-    "hickory-server/dnssec-openssl",
-    "hickory-client/dnssec-openssl",
-    "hickory-proto/dnssec-openssl",
-]
-# TODO: dnssec-openssl is enabled for RSA support, we should add testing support for just the Ring toolchain
 dnssec-ring = [
     "dnssec",
     "hickory-resolver/dnssec-ring",
     "hickory-server/dnssec-ring",
     "hickory-client/dnssec-ring",
-    "hickory-client/dnssec-openssl",
     "hickory-proto/dnssec-ring",
+    "dep:rustls-pki-types",
 ]
-dnssec = ["dep:openssl"]
+dnssec = []
 
 dns-over-https-rustls = [
     "hickory-client/dns-over-https-rustls",
@@ -70,14 +62,6 @@ dns-over-h3 = [
     "hickory-resolver/dns-over-h3",
 ]
 
-# TODO: need to make server support rustls and native-tls
-# dns-over-native-tls = ["dns-over-tls",  "hickory-resolver/dns-over-native-tls", "hickory-server/dns-over-native-tls"]
-dns-over-openssl = [
-    "dns-over-tls",
-    "hickory-proto/dns-over-openssl",
-    "hickory-resolver/dns-over-openssl",
-    "hickory-server/dns-over-openssl",
-]
 dns-over-rustls = [
     "dns-over-tls",
     "hickory-proto/dns-over-rustls",
@@ -93,10 +77,10 @@ sqlite = ["rusqlite", "hickory-server/sqlite"]
 async-trait.workspace = true
 futures = { workspace = true, features = ["executor"] }
 once_cell.workspace = true
-openssl = { workspace = true, optional = true, features = ["v102", "v110"] }
 rand.workspace = true
 rusqlite = { workspace = true, features = ["bundled"], optional = true }
 rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 time.workspace = true
 tokio = { workspace = true, features = ["time", "rt"] }
 tracing.workspace = true
@@ -109,8 +93,10 @@ webpki-roots = { workspace = true, optional = true }
 [dev-dependencies]
 futures = { workspace = true, features = ["thread-pool"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
-tracing-subscriber = { workspace = true, features = [
-    "std",
-    "fmt",
-    "env-filter",
-] }
+test-support.workspace = true
+tracing-subscriber.workspace = true
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true
+denylist = ["dnssec"]
+max_combination_size = 2

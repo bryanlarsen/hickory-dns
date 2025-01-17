@@ -1,16 +1,20 @@
 use core::fmt;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use url::Url;
 
-use crate::FQDN;
+use crate::zone_file::ZoneFile;
+use crate::{Error, FQDN};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Config<'a> {
     NameServer {
         origin: &'a FQDN,
         use_dnssec: bool,
+        additional_zones: HashMap<FQDN, ZoneFile>,
     },
     Resolver {
         use_dnssec: bool,
@@ -38,22 +42,32 @@ pub enum Role {
 #[derive(Clone, Debug)]
 pub enum Implementation {
     Bind,
-    Hickory(Repository<'static>),
+    Dnslib,
+    Hickory {
+        repo: Repository<'static>,
+        dnssec_feature: Option<HickoryDnssecFeature>,
+    },
     Unbound,
+    EdeDotCom,
 }
 
 impl Implementation {
     pub fn supports_ede(&self) -> bool {
         match self {
             Implementation::Bind => false,
-            Implementation::Hickory(_) => true,
+            Implementation::Dnslib => true,
+            Implementation::Hickory { .. } => true,
             Implementation::Unbound => true,
+            Implementation::EdeDotCom => false, // does not support running a resolver
         }
     }
 
     /// Returns the latest hickory-dns local revision
     pub fn hickory() -> Self {
-        Self::Hickory(Repository(crate::repo_root()))
+        Self::Hickory {
+            repo: Repository(crate::repo_root()),
+            dnssec_feature: None,
+        }
     }
 
     /// A test peer that cannot be changed using the `DNS_TEST_PEER` env variable
@@ -67,8 +81,13 @@ impl Implementation {
     }
 
     #[must_use]
+    pub fn is_dnslib(&self) -> bool {
+        matches!(self, Self::Dnslib)
+    }
+
+    #[must_use]
     pub fn is_hickory(&self) -> bool {
-        matches!(self, Self::Hickory(_))
+        matches!(self, Self::Hickory { .. })
     }
 
     #[must_use]
@@ -93,7 +112,12 @@ impl Implementation {
                     )
                 }
 
-                Self::Hickory(_) => {
+                Self::Dnslib => {
+                    // Dnslib resolvers don't have a config
+                    "".into()
+                }
+
+                Self::Hickory { .. } => {
                     // TODO enable EDE in Hickory when supported
                     minijinja::render!(
                         include_str!("templates/hickory.resolver.toml.jinja"),
@@ -109,51 +133,78 @@ impl Implementation {
                         ede => ede,
                     )
                 }
+
+                Self::EdeDotCom => {
+                    // Does not support running a resolver
+                    "".into()
+                }
             },
 
-            Config::NameServer { origin, use_dnssec } => match self {
+            Config::NameServer {
+                origin,
+                use_dnssec,
+                additional_zones,
+            } => match self {
                 Self::Bind => {
                     minijinja::render!(
                         include_str!("templates/named.name-server.conf.jinja"),
-                        fqdn => origin.as_str()
+                        fqdn => origin.as_str(),
+                        additional_zones => additional_zones.keys().map(|x| x.as_str()).collect::<Vec<&str>>(),
                     )
+                }
+
+                Self::Dnslib => {
+                    // Dnslib name servers don't have a config
+                    "".into()
                 }
 
                 Self::Unbound => {
                     minijinja::render!(
                         include_str!("templates/nsd.conf.jinja"),
-                        fqdn => origin.as_str()
+                        fqdn => origin.as_str(),
+                        additional_zones => additional_zones.keys().map(|x| x.as_str()).collect::<Vec<&str>>(),
                     )
                 }
 
-                Self::Hickory(_) => {
+                Self::Hickory { dnssec_feature, .. } => {
+                    let use_pkcs8 =
+                        matches!(dnssec_feature, None | Some(HickoryDnssecFeature::Ring));
                     minijinja::render!(
                         include_str!("templates/hickory.name-server.toml.jinja"),
                         fqdn => origin.as_str(),
                         use_dnssec => use_dnssec,
+                        additional_zones => additional_zones.keys().map(|x| x.as_str()).collect::<Vec<&str>>(),
+                        use_pkcs8 => use_pkcs8,
                     )
                 }
+
+                Self::EdeDotCom => include_str!("templates/named.ede-dot-com.conf").into(),
             },
         }
     }
 
-    pub(crate) fn conf_file_path(&self, role: Role) -> &'static str {
+    pub(crate) fn conf_file_path(&self, role: Role) -> Option<&'static str> {
         match self {
-            Self::Bind => "/etc/bind/named.conf",
+            Self::Bind => Some("/etc/bind/named.conf"),
 
-            Self::Hickory(_) => "/etc/named.toml",
+            Self::Dnslib => None,
+
+            Self::Hickory { .. } => Some("/etc/named.toml"),
 
             Self::Unbound => match role {
-                Role::NameServer => "/etc/nsd/nsd.conf",
-                Role::Resolver => "/etc/unbound/unbound.conf",
+                Role::NameServer => Some("/etc/nsd/nsd.conf"),
+                Role::Resolver => Some("/etc/unbound/unbound.conf"),
             },
+
+            Self::EdeDotCom => Some("/etc/named.conf"),
         }
     }
 
     pub(crate) fn cmd_args(&self, role: Role) -> Vec<String> {
         let base = match self {
-            Implementation::Bind => "named -g -d5",
-            Implementation::Hickory(_) => "hickory-dns -d",
+            Implementation::Bind | Implementation::EdeDotCom => "named -g -d5",
+            Implementation::Dnslib => "python3 /script.py",
+            Implementation::Hickory { .. } => "hickory-dns -d",
             Implementation::Unbound => match role {
                 Role::NameServer => "nsd -d",
                 Role::Resolver => "unbound -d",
@@ -183,9 +234,11 @@ impl Implementation {
         let suffix = stream.as_str();
 
         let path = match self {
-            Implementation::Bind => "/tmp/named",
+            Implementation::Bind | Implementation::EdeDotCom => "/tmp/named",
 
-            Implementation::Hickory(_) => "/tmp/hickory",
+            Implementation::Dnslib => "/tmp/dnslib",
+
+            Implementation::Hickory { .. } => "/tmp/hickory",
 
             Implementation::Unbound => match role {
                 Role::NameServer => "/tmp/nsd",
@@ -194,6 +247,33 @@ impl Implementation {
         };
 
         format!("{path}.{suffix}")
+    }
+}
+
+/// A Hickory DNS Cargo feature used to enable DNSSEC with a particular cryptography library.
+#[derive(Debug, Clone, Copy)]
+pub enum HickoryDnssecFeature {
+    Ring,
+}
+
+impl fmt::Display for HickoryDnssecFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ring => "dnssec-ring",
+        })
+    }
+}
+
+impl FromStr for HickoryDnssecFeature {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dnssec-ring" => Ok(Self::Ring),
+            _ => {
+                Err(format!("invalid value for DNSSEC_FEATURE: {s}, expected  dnssec-ring").into())
+            }
+        }
     }
 }
 
@@ -209,18 +289,6 @@ impl Stream {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
         }
-    }
-}
-
-impl fmt::Display for Implementation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Implementation::Bind => "bind",
-            Implementation::Hickory(_) => "hickory",
-            Implementation::Unbound => "unbound",
-        };
-
-        f.write_str(s)
     }
 }
 

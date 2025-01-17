@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use cfg_if::cfg_if;
 
+#[cfg(feature = "dnssec-ring")]
+use crate::{authority::DnssecSummary, proto::dnssec::Proof};
+
 use crate::authority::{LookupObject, LookupOptions};
 use crate::proto::rr::{LowerName, Record, RecordSet, RecordType, RrsetRecords};
 
@@ -86,10 +89,7 @@ impl AuthLookup {
     /// Takes the additional records, leaving behind None
     pub fn take_additionals(&mut self) -> Option<LookupRecords> {
         match self {
-            Self::Records {
-                ref mut additionals,
-                ..
-            } => additionals.take(),
+            Self::Records { additionals, .. } => additionals.take(),
             _ => None,
         }
     }
@@ -108,6 +108,25 @@ impl LookupObject for AuthLookup {
     fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
         let additionals = Self::take_additionals(self);
         additionals.map(|a| Box::new(a) as Box<dyn LookupObject>)
+    }
+
+    #[cfg(feature = "dnssec-ring")]
+    fn dnssec_summary(&self) -> DnssecSummary {
+        let mut all_secure = None;
+        for record in self {
+            match record.proof() {
+                Proof::Secure => {
+                    all_secure.get_or_insert(true);
+                }
+                Proof::Bogus => return DnssecSummary::Bogus,
+                _ => all_secure = Some(false),
+            }
+        }
+
+        match all_secure {
+            Some(true) => DnssecSummary::Secure,
+            _ => DnssecSummary::Insecure,
+        }
     }
 }
 
@@ -247,7 +266,7 @@ impl<'r> Iterator for AnyRecordsIter<'r> {
         let query_name = self.query_name;
 
         loop {
-            if let Some(ref mut records) = self.records {
+            if let Some(records) = &mut self.records {
                 let record = records
                     .by_ref()
                     .filter(|rr_set| {
@@ -270,7 +289,7 @@ impl<'r> Iterator for AnyRecordsIter<'r> {
 
             // getting here, we must have exhausted our records from the rrset
             cfg_if! {
-                if #[cfg(feature = "dnssec")] {
+                if #[cfg(feature = "dnssec-ring")] {
                     self.records = Some(
                         self.rrset
                             .expect("rrset should not be None at this point")
@@ -385,7 +404,7 @@ impl<'r> Iterator for LookupRecordsIter<'r> {
             LookupRecordsIter::Empty => None,
             LookupRecordsIter::AnyRecordsIter(current) => current.next(),
             LookupRecordsIter::RecordsIter(current) => current.next(),
-            LookupRecordsIter::ManyRecordsIter(set, ref mut current) => loop {
+            LookupRecordsIter::ManyRecordsIter(set, current) => loop {
                 if let Some(o) = current.as_mut().and_then(Iterator::next) {
                     return Some(o);
                 }

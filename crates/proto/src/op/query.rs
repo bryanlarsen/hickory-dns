@@ -19,6 +19,9 @@
 use std::fmt;
 use std::fmt::{Display, Formatter};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::error::*;
 use crate::rr::dns_class::DNSClass;
 use crate::rr::domain::Name;
@@ -59,6 +62,7 @@ const MDNS_UNICAST_RESPONSE: u16 = 1 << 15;
 ///
 /// ```
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Query {
     name: Name,
     query_type: RecordType,
@@ -71,7 +75,7 @@ impl Default for Query {
     /// Return a default query with an empty name and A, IN for the query_type and query_class
     fn default() -> Self {
         Self {
-            name: Name::new(),
+            name: Name::root(),
             query_type: RecordType::A,
             query_class: DNSClass::IN,
             #[cfg(feature = "mdns")]
@@ -119,7 +123,6 @@ impl Query {
     /// Changes mDNS unicast-response bit
     /// See [RFC 6762](https://tools.ietf.org/html/rfc6762#section-5.4)
     #[cfg(feature = "mdns")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     pub fn set_mdns_unicast_response(&mut self, flag: bool) -> &mut Self {
         self.mdns_unicast_response = flag;
         self
@@ -158,7 +161,6 @@ impl Query {
     /// Returns if the mDNS unicast-response bit is set or not
     /// See [RFC 6762](https://tools.ietf.org/html/rfc6762#section-5.4)
     #[cfg(feature = "mdns")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     pub fn mdns_unicast_response(&self) -> bool {
         self.mdns_unicast_response
     }
@@ -181,7 +183,6 @@ pub struct QueryParts {
     pub query_class: DNSClass,
     /// mDNS unicast-response bit set or not
     #[cfg(feature = "mdns")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "mdns")))]
     pub mdns_unicast_response: bool,
 }
 
@@ -299,7 +300,7 @@ impl Display for Query {
 #[allow(clippy::needless_update)]
 fn test_read_and_emit() {
     let expect = Query {
-        name: Name::from_ascii("WWW.example.com").unwrap(),
+        name: Name::from_ascii("WWW.example.com.").unwrap(),
         query_type: RecordType::AAAA,
         query_class: DNSClass::IN,
         ..Query::default()

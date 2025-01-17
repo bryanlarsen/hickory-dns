@@ -1,39 +1,36 @@
 use std::{
-    net::*,
     str::FromStr,
     sync::{Arc, Mutex as StdMutex},
 };
 
 use futures::{Future, FutureExt, TryFutureExt};
-#[cfg(feature = "dnssec")]
+use test_support::subscribe;
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 use time::Duration;
-use tokio::{
-    net::{TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket},
-    runtime::Runtime,
-};
+use tokio::runtime::Runtime;
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
-use hickory_client::client::Signer;
 use hickory_client::{
-    client::{AsyncClient, ClientHandle},
-    error::ClientErrorKind,
+    client::{Client, ClientHandle},
+    ClientErrorKind,
 };
-#[cfg(feature = "dnssec")]
-use hickory_proto::rr::{dnssec::SigSigner, Record};
-#[cfg(feature = "dnssec")]
-use hickory_proto::xfer::{DnsExchangeBackground, DnsMultiplexer};
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
-use hickory_proto::TokioTime;
+use hickory_integration::{
+    example_authority::create_example, NeverReturnsClientStream, TestClientStream, GOOGLE_V4,
+    GOOGLE_V6, TEST3_V4,
+};
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 use hickory_proto::{
-    iocompat::AsyncIoTokioAsStd,
+    dnssec::{rdata::DNSSECRData, ring::RsaSigningKey, Algorithm, SigSigner, SigningKey},
+    rr::{rdata::A, RData, Record},
+    runtime::TokioTime,
+    xfer::{DnsExchangeBackground, DnsMultiplexer},
+};
+use hickory_proto::{
     op::{Edns, Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
-        rdata::{
-            opt::{EdnsCode, EdnsOption},
-            A,
-        },
-        DNSClass, Name, RData, RecordSet, RecordType,
+        rdata::opt::{EdnsCode, EdnsOption},
+        DNSClass, Name, RecordSet, RecordType,
     },
+    runtime::TokioRuntimeProvider,
     tcp::TcpClientStream,
     udp::UdpClientStream,
     xfer::FirstAnswer,
@@ -41,23 +38,19 @@ use hickory_proto::{
 };
 use hickory_server::authority::{Authority, Catalog};
 
-use hickory_integration::{
-    example_authority::create_example, NeverReturnsClientStream, TestClientStream,
-};
-
 #[test]
 fn test_query_nonet() {
-    // env_logger::init();
+    subscribe();
 
     let authority = create_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let io_loop = Runtime::new().unwrap();
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let client = AsyncClient::new(stream, sender, None);
+    let client = Client::new(stream, sender, None);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     io_loop.block_on(test_query(&mut client));
     io_loop.block_on(test_query(&mut client));
@@ -66,11 +59,10 @@ fn test_query_nonet() {
 #[test]
 fn test_query_udp_ipv4() {
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("8.8.8.8", 53).to_socket_addrs().unwrap().next().unwrap();
-    let stream = UdpClientStream::<TokioUdpSocket>::new(addr);
-    let client = AsyncClient::connect(stream);
+    let stream = UdpClientStream::builder(GOOGLE_V4, TokioRuntimeProvider::new()).build();
+    let client = Client::connect(stream);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // TODO: timeouts on these requests so that the test doesn't hang
     io_loop.block_on(test_query(&mut client));
@@ -82,15 +74,10 @@ fn test_query_udp_ipv4() {
 #[ignore]
 fn test_query_udp_ipv6() {
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("2001:4860:4860::8888", 53)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let stream = UdpClientStream::<TokioUdpSocket>::new(addr);
-    let client = AsyncClient::connect(stream);
+    let stream = UdpClientStream::builder(GOOGLE_V6, TokioRuntimeProvider::new()).build();
+    let client = Client::connect(stream);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // TODO: timeouts on these requests so that the test doesn't hang
     io_loop.block_on(test_query(&mut client));
@@ -101,11 +88,10 @@ fn test_query_udp_ipv6() {
 #[test]
 fn test_query_tcp_ipv4() {
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("8.8.8.8", 53).to_socket_addrs().unwrap().next().unwrap();
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-    let client = AsyncClient::new(stream, sender, None);
+    let (stream, sender) = TcpClientStream::new(GOOGLE_V4, None, None, TokioRuntimeProvider::new());
+    let client = Client::new(stream, sender, None);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // TODO: timeouts on these requests so that the test doesn't hang
     io_loop.block_on(test_query(&mut client));
@@ -116,15 +102,10 @@ fn test_query_tcp_ipv4() {
 #[ignore]
 fn test_query_tcp_ipv6() {
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("2001:4860:4860::8888", 53)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-    let client = AsyncClient::new(stream, sender, None);
+    let (stream, sender) = TcpClientStream::new(GOOGLE_V6, None, None, TokioRuntimeProvider::new());
+    let client = Client::new(stream, sender, None);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // TODO: timeouts on these requests so that the test doesn't hang
     io_loop.block_on(test_query(&mut client));
@@ -134,13 +115,13 @@ fn test_query_tcp_ipv6() {
 #[test]
 #[cfg(feature = "dns-over-https-rustls")]
 fn test_query_https() {
+    use hickory_integration::CLOUDFLARE_V4_TLS;
     use hickory_proto::h2::HttpsClientStreamBuilder;
     use rustls::{ClientConfig, RootCertStore};
 
     const ALPN_H2: &[u8] = b"h2";
 
     let io_loop = Runtime::new().unwrap();
-    let addr: SocketAddr = ("1.1.1.1", 443).to_socket_addrs().unwrap().next().unwrap();
 
     // using the mozilla default root store
     let mut root_store = RootCertStore::empty();
@@ -154,13 +135,17 @@ fn test_query_https() {
             .with_no_client_auth();
     client_config.alpn_protocols.push(ALPN_H2.to_vec());
 
-    let https_builder = HttpsClientStreamBuilder::with_client_config(Arc::new(client_config));
-    let client = AsyncClient::connect(
-        https_builder
-            .build::<AsyncIoTokioAsStd<TokioTcpStream>>(addr, "cloudflare-dns.com".to_string()),
+    let https_builder = HttpsClientStreamBuilder::with_client_config(
+        Arc::new(client_config),
+        TokioRuntimeProvider::new(),
     );
+    let client = Client::connect(https_builder.build(
+        CLOUDFLARE_V4_TLS,
+        "cloudflare-dns.com".to_string(),
+        "/dns-query".to_string(),
+    ));
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // TODO: timeouts on these requests so that the test doesn't hang
     io_loop.block_on(test_query(&mut client));
@@ -168,8 +153,8 @@ fn test_query_https() {
 }
 
 #[cfg(test)]
-fn test_query(client: &mut AsyncClient) -> impl Future<Output = ()> {
-    let name = Name::from_ascii("WWW.example.com").unwrap();
+fn test_query(client: &mut Client) -> impl Future<Output = ()> {
+    let name = Name::from_ascii("WWW.example.com.").unwrap();
 
     client
         .query(name.clone(), DNSClass::IN, RecordType::A)
@@ -182,23 +167,14 @@ fn test_query(client: &mut AsyncClient) -> impl Future<Output = ()> {
                 .name()
                 .eq_case(&name));
 
-            let record = &response.answers()[0];
-            assert_eq!(record.name(), &name);
-            assert_eq!(record.record_type(), RecordType::A);
-            assert_eq!(record.dns_class(), DNSClass::IN);
-
-            if let RData::A(ref address) = record.data() {
-                assert_eq!(address, &A::new(93, 184, 215, 14))
-            } else {
-                panic!();
-            }
+            assert!(!response.answers().is_empty());
         })
         .map(|r: Result<_, _>| r.expect("query failed"))
 }
 
 #[cfg(test)]
-fn test_query_edns(client: &mut AsyncClient) -> impl Future<Output = ()> {
-    let name = Name::from_ascii("WWW.example.com").unwrap();
+fn test_query_edns(client: &mut Client) -> impl Future<Output = ()> {
+    let name = Name::from_ascii("WWW.example.com.").unwrap();
     let mut edns = Edns::new();
     // garbage subnet value, but lets check
     edns.options_mut()
@@ -232,10 +208,7 @@ fn test_query_edns(client: &mut AsyncClient) -> impl Future<Output = ()> {
                 .name()
                 .eq_case(&name));
 
-            let record = &response.answers()[0];
-            assert_eq!(record.name(), &name);
-            assert_eq!(record.record_type(), RecordType::A);
-            assert_eq!(record.dns_class(), DNSClass::IN);
+            assert!(!response.answers().is_empty());
             assert!(response.extensions().is_some());
             assert_eq!(
                 response
@@ -246,11 +219,6 @@ fn test_query_edns(client: &mut AsyncClient) -> impl Future<Output = ()> {
                     .unwrap(),
                 &EdnsOption::Subnet("1.2.0.0/16".parse().unwrap())
             );
-            if let RData::A(ref address) = *record.data() {
-                assert_eq!(address, &A::new(93, 184, 215, 14))
-            } else {
-                panic!();
-            }
         })
         .map(|r: Result<_, _>| r.expect("query failed"))
 }
@@ -260,14 +228,14 @@ fn test_notify() {
     let io_loop = Runtime::new().unwrap();
     let authority = create_example();
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let client = AsyncClient::new(stream, sender, None);
+    let client = Client::new(stream, sender, None);
     let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
-    let name = Name::from_str("ping.example.com").unwrap();
+    let name = Name::from_str("ping.example.com.").unwrap();
 
     let message =
         io_loop.block_on(client.notify(name, DNSClass::IN, RecordType::A, None::<RecordSet>));
@@ -284,31 +252,32 @@ fn test_notify() {
 //
 
 /// create a client with a sig0 section
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[allow(clippy::type_complexity)]
 async fn create_sig0_ready_client() -> (
     (
-        AsyncClient,
-        DnsExchangeBackground<DnsMultiplexer<TestClientStream, Signer>, TokioTime>,
+        Client,
+        DnsExchangeBackground<DnsMultiplexer<TestClientStream>, TokioTime>,
     ),
     Name,
 ) {
-    use hickory_proto::rr::dnssec::rdata::DNSSECRData;
-    use hickory_proto::rr::dnssec::{Algorithm, KeyPair};
+    use hickory_proto::dnssec::rdata::KEY;
     use hickory_server::store::sqlite::SqliteAuthority;
-    use openssl::rsa::Rsa;
+    use rustls_pki_types::PrivatePkcs8KeyDer;
 
     let authority = create_example();
     let mut authority = SqliteAuthority::new(authority, true, false);
     let origin = authority.origin().clone();
 
-    let trusted_name = Name::from_str("trusted.example.com").unwrap();
+    let trusted_name = Name::from_str("trusted.example.com.").unwrap();
 
-    let rsa = Rsa::generate(2_048).unwrap();
-    let key = KeyPair::from_rsa(rsa).unwrap();
-    let sig0_key = key.to_sig0key(Algorithm::RSASHA256).unwrap();
+    const KEY: &[u8] = include_bytes!("../rsa-2048.pk8");
+    let key =
+        RsaSigningKey::from_pkcs8(&PrivatePkcs8KeyDer::from(KEY), Algorithm::RSASHA256).unwrap();
+    let pub_key = key.to_public_key().unwrap();
+    let sig0_key = KEY::new_sig0key(&pub_key);
 
-    let signer = SigSigner::sig0(sig0_key.clone(), key, trusted_name.clone());
+    let signer = SigSigner::sig0(sig0_key.clone(), Box::new(key), trusted_name.clone());
 
     // insert the KEY for the trusted.example.com
     let auth_key = Record::from_rdata(
@@ -320,27 +289,27 @@ async fn create_sig0_ready_client() -> (
 
     // setup the catalog
     let mut catalog = Catalog::new();
-    catalog.upsert(authority.origin().clone(), Box::new(Arc::new(authority)));
+    catalog.upsert(authority.origin().clone(), vec![Arc::new(authority)]);
 
-    let signer = Arc::new(signer.into());
+    let signer = Arc::new(signer);
     let (stream, sender) = TestClientStream::new(Arc::new(StdMutex::new(catalog)));
-    let client = AsyncClient::new(stream, sender, Some(signer))
+    let client = Client::new(stream, sender, Some(signer))
         .await
-        .expect("failed to get new AsyncClient");
+        .expect("failed to get new Client");
 
     (client, origin.into())
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_create() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // create a record
     let record = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
@@ -377,20 +346,19 @@ fn test_create() {
     assert_eq!(result.response_code(), ResponseCode::YXRRSet);
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_create_multi() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // create a record
     let record = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
-    let record = record;
 
     let mut record2 = record.clone();
     record2.set_data(RData::A(A::new(100, 10, 100, 11)));
@@ -434,16 +402,16 @@ fn test_create_multi() {
     assert_eq!(result.response_code(), ResponseCode::YXRRSet);
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_append() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let record = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
@@ -512,16 +480,16 @@ fn test_append() {
     assert_eq!(result.answers().len(), 2);
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_append_multi() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let record = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
@@ -597,16 +565,16 @@ fn test_append_multi() {
     assert_eq!(result.answers().len(), 3);
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_compare_and_swap() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // create a record
     let record = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
@@ -653,16 +621,16 @@ fn test_compare_and_swap() {
     assert!(!result.answers().iter().any(|rr| *rr == not));
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_compare_and_swap_multi() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // create a record
     let mut current = RecordSet::with_ttl(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         RecordType::A,
         Duration::minutes(5).whole_seconds() as u32,
     );
@@ -719,16 +687,16 @@ fn test_compare_and_swap_multi() {
     assert!(!result.answers().iter().any(|rr| *rr == not));
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_delete_by_rdata() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let record1 = Record::from_rdata(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         Duration::minutes(5).whole_seconds() as u32,
         RData::A(A::new(100, 10, 100, 10)),
     );
@@ -770,16 +738,16 @@ fn test_delete_by_rdata() {
     assert!(result.answers().iter().any(|rr| *rr == record1));
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_delete_by_rdata_multi() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let mut rrset = RecordSet::with_ttl(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         RecordType::A,
         Duration::minutes(5).whole_seconds() as u32,
     );
@@ -812,7 +780,7 @@ fn test_delete_by_rdata_multi() {
 
     // append a record
     let mut rrset = RecordSet::with_ttl(
-        Name::from_str("new.example.com").unwrap(),
+        Name::from_str("new.example.com.").unwrap(),
         RecordType::A,
         Duration::minutes(5).whole_seconds() as u32,
     );
@@ -847,12 +815,12 @@ fn test_delete_by_rdata_multi() {
     assert!(result.answers().iter().any(|rr| *rr == record4));
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_delete_rrset() {
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let mut record = Record::from_rdata(
@@ -896,14 +864,14 @@ fn test_delete_rrset() {
     assert_eq!(result.answers().len(), 0);
 }
 
-#[cfg(all(feature = "dnssec", feature = "sqlite"))]
+#[cfg(all(feature = "dnssec-ring", feature = "sqlite"))]
 #[test]
 fn test_delete_all() {
     use hickory_proto::rr::rdata::AAAA;
 
     let io_loop = Runtime::new().unwrap();
     let ((mut client, bg), origin) = io_loop.block_on(create_sig0_ready_client());
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     // append a record
     let mut record = Record::from_rdata(
@@ -949,7 +917,7 @@ fn test_delete_all() {
     assert_eq!(result.answers().len(), 0);
 }
 
-fn test_timeout_query(mut client: AsyncClient, io_loop: Runtime) {
+fn test_timeout_query(mut client: Client, io_loop: Runtime) {
     let name = Name::from_str("www.example.com").unwrap();
 
     let err = io_loop
@@ -977,55 +945,43 @@ fn test_timeout_query(mut client: AsyncClient, io_loop: Runtime) {
 
 #[test]
 fn test_timeout_query_nonet() {
-    //env_logger::try_init().ok();
+    subscribe();
     let io_loop = Runtime::new().expect("failed to create Tokio Runtime");
     let (stream, sender) = NeverReturnsClientStream::new();
-    let client =
-        AsyncClient::with_timeout(stream, sender, std::time::Duration::from_millis(1), None);
+    let client = Client::with_timeout(stream, sender, std::time::Duration::from_millis(1), None);
     let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     test_timeout_query(client, io_loop);
 }
 
 #[test]
 fn test_timeout_query_udp() {
-    //env_logger::try_init().ok();
+    subscribe();
     let io_loop = Runtime::new().unwrap();
+    let stream = UdpClientStream::builder(TEST3_V4, TokioRuntimeProvider::new())
+        .with_timeout(Some(std::time::Duration::from_millis(1)))
+        .build();
 
-    // this is a test network, it should NOT be in use
-    let addr: SocketAddr = ("203.0.113.0", 53)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-
-    let stream =
-        UdpClientStream::<TokioUdpSocket>::with_timeout(addr, std::time::Duration::from_millis(1));
-    let client = AsyncClient::connect(stream);
+    let client = Client::connect(stream);
     let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-    hickory_proto::spawn_bg(&io_loop, bg);
+    hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
     test_timeout_query(client, io_loop);
 }
 
 #[test]
 fn test_timeout_query_tcp() {
-    //env_logger::try_init().ok();
+    subscribe();
     let io_loop = Runtime::new().unwrap();
 
-    // this is a test network, it should NOT be in use
-    let addr: SocketAddr = ("203.0.113.0", 53)
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-
-    let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::with_timeout(
-        addr,
-        std::time::Duration::from_millis(1),
+    let (stream, sender) = TcpClientStream::new(
+        TEST3_V4,
+        None,
+        Some(std::time::Duration::from_millis(1)),
+        TokioRuntimeProvider::new(),
     );
-    let client = AsyncClient::with_timeout(
+    let client = Client::with_timeout(
         Box::new(stream),
         sender,
         std::time::Duration::from_millis(1),

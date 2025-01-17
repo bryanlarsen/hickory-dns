@@ -24,14 +24,14 @@
     clippy::upper_case_acronyms, // can be removed on a major release boundary
 )]
 #![recursion_limit = "2048"]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub mod error;
+mod error;
 mod recursor;
 mod recursor_dns_handle;
 pub(crate) mod recursor_pool;
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,9 +39,8 @@ pub use error::{Error, ErrorKind};
 pub use hickory_proto as proto;
 pub use hickory_resolver as resolver;
 pub use hickory_resolver::config::{NameServerConfig, NameServerConfigGroup};
-#[cfg(feature = "dnssec")]
-use proto::rr::dnssec::TrustAnchor;
-
+#[cfg(feature = "dnssec-ring")]
+use proto::dnssec::TrustAnchor;
 use proto::{op::Query, xfer::DnsResponse};
 pub use recursor::{Recursor, RecursorBuilder};
 use resolver::{dns_lru::DnsLru, lookup::Lookup, Name};
@@ -57,11 +56,11 @@ pub enum DnssecPolicy {
     SecurityUnaware,
 
     /// DNSSEC validation is disabled; DNSSEC records will be requested and processed
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     ValidationDisabled,
 
     /// DNSSEC validation is enabled and will use the chosen `trust_anchor` set of keys
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     ValidateWithStaticKey {
         /// set to `None` to use built-in trust anchor
         trust_anchor: Option<Arc<TrustAnchor>>,

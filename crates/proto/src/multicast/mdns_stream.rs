@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::stream::{Stream, StreamExt};
-use futures_util::{future, future::Future, ready, FutureExt, TryFutureExt};
+use futures_util::{future, ready, FutureExt, TryFutureExt};
 use once_cell::sync::Lazy;
 use rand;
 use rand::distributions::{uniform::Uniform, Distribution};
@@ -22,6 +22,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
 use crate::multicast::MdnsQueryType;
+use crate::runtime::TokioRuntimeProvider;
 use crate::udp::UdpStream;
 use crate::xfer::SerialMessage;
 use crate::BufDnsStreamHandle;
@@ -44,7 +45,7 @@ pub struct MdnsStream {
     /// Multicast address used for mDNS queries
     multicast_addr: SocketAddr,
     /// This is used for sending and (directly) receiving messages
-    datagram: Option<UdpStream<UdpSocket>>,
+    datagram: Option<UdpStream<TokioRuntimeProvider>>,
     // FIXME: like UdpStream, this Arc is unnecessary, only needed for temp async/await capture below
     /// In one-shot multicast, this will not join the multicast group
     multicast: Option<Arc<UdpSocket>>,
@@ -169,20 +170,16 @@ impl MdnsStream {
     ///
     /// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms737550(v=vs.85).aspx
     #[cfg(windows)]
-    #[cfg_attr(docsrs, doc(cfg(windows)))]
     fn bind_multicast(socket: &Socket, multicast_addr: &SocketAddr) -> io::Result<()> {
-        let multicast_addr = match *multicast_addr {
-            SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), addr.port()),
-            SocketAddr::V6(addr) => {
-                SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
-            }
+        let multicast_addr = match multicast_addr {
+            SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), addr.port()),
+            SocketAddr::V6(addr) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), addr.port()),
         };
         socket.bind(&socket2::SockAddr::from(multicast_addr))
     }
 
     /// On unixes we bind to the multicast address, which causes multicast packets to be filtered
     #[cfg(unix)]
-    #[cfg_attr(docsrs, doc(cfg(unix)))]
     fn bind_multicast(socket: &Socket, multicast_addr: &SocketAddr) -> io::Result<()> {
         socket.bind(&socket2::SockAddr::from(*multicast_addr))
     }
@@ -208,17 +205,17 @@ impl MdnsStream {
         // binding the UdpSocket to the multicast address tells the OS to filter all packets on this socket to just this
         //   multicast address
         // TODO: allow the binding interface to be specified
-        let socket = match ip_addr {
-            IpAddr::V4(ref mdns_v4) => {
+        let socket = match &ip_addr {
+            IpAddr::V4(mdns_v4) => {
                 let socket = Socket::new(
                     socket2::Domain::IPV4,
                     socket2::Type::DGRAM,
                     Some(socket2::Protocol::UDP),
                 )?;
-                socket.join_multicast_v4(mdns_v4, &Ipv4Addr::new(0, 0, 0, 0))?;
+                socket.join_multicast_v4(mdns_v4, &Ipv4Addr::UNSPECIFIED)?;
                 socket
             }
-            IpAddr::V6(ref mdns_v6) => {
+            IpAddr::V6(mdns_v6) => {
                 let socket = Socket::new(
                     socket2::Domain::IPV6,
                     socket2::Type::DGRAM,
@@ -249,9 +246,9 @@ impl MdnsStream {
         ipv4_if: Option<Ipv4Addr>,
         ipv6_if: Option<u32>,
     ) -> NextRandomUdpSocket {
-        let bind_address: IpAddr = match *multicast_addr {
-            SocketAddr::V4(..) => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            SocketAddr::V6(..) => IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
+        let bind_address: IpAddr = match multicast_addr {
+            SocketAddr::V4(..) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(..) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
 
         NextRandomUdpSocket {
@@ -271,7 +268,7 @@ impl Stream for MdnsStream {
         assert!(self.datagram.is_some() || self.multicast.is_some());
 
         // we poll the datagram socket first, if available, since it's a direct response or direct request
-        if let Some(ref mut datagram) = self.as_mut().datagram {
+        if let Some(datagram) = self.as_mut().datagram.as_mut() {
             match datagram.poll_next_unpin(cx) {
                 Poll::Ready(ready) => return Poll::Ready(ready),
                 Poll::Pending => (), // drop through
@@ -279,7 +276,7 @@ impl Stream for MdnsStream {
         }
 
         loop {
-            let msg = if let Some(ref mut receiving) = self.rcving_mcast {
+            let msg = if let Some(receiving) = self.rcving_mcast.as_mut() {
                 // TODO: should we drop this packet if it's not from the same src as dest?
                 let msg = ready!(receiving.as_mut().poll_unpin(cx))?;
 
@@ -295,7 +292,7 @@ impl Stream for MdnsStream {
             }
 
             // let socket = Arc::clone(socket);
-            if let Some(ref socket) = self.multicast {
+            if let Some(socket) = &self.multicast {
                 let socket = Arc::clone(socket);
                 let receive_future = async {
                     let socket = socket;
@@ -334,9 +331,7 @@ impl NextRandomUdpSocket {
         match addr {
             SocketAddr::V4(..) => {
                 socket.set_multicast_loop_v4(true)?;
-                socket.set_multicast_if_v4(
-                    &self.ipv4_if.unwrap_or_else(|| Ipv4Addr::new(0, 0, 0, 0)),
-                )?;
+                socket.set_multicast_if_v4(&self.ipv4_if.unwrap_or(Ipv4Addr::UNSPECIFIED))?;
                 if let Some(ttl) = self.packet_ttl {
                     socket.set_ttl(ttl)?;
                     socket.set_multicast_ttl_v4(ttl)?;
@@ -429,6 +424,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::xfer::dns_handle::DnsStreamHandle;
     use futures_util::future::Either;
+    use test_support::subscribe;
     use tokio::runtime;
 
     // TODO: is there a better way?
@@ -443,8 +439,7 @@ pub(crate) mod tests {
     // one_shot tests are basically clones from the udp tests
     #[test]
     fn test_next_random_socket() {
-        // use env_logger;
-        // env_logger::init();
+        subscribe();
 
         let io_loop = runtime::Runtime::new().unwrap();
         let (stream, _) = MdnsStream::new(

@@ -7,14 +7,11 @@
 
 use std::fmt;
 
-use crate::proto::error::*;
 use thiserror::Error;
 
 #[cfg(feature = "backtrace")]
 use crate::proto::{trace, ExtBacktrace};
-
-/// An alias for results returned by functions of this crate
-pub type Result<T> = ::std::result::Result<T, Error>;
+use crate::proto::{ProtoError, ProtoErrorKind};
 
 /// The error kind for errors that get returned in the crate
 #[derive(Debug, Error)]
@@ -40,7 +37,6 @@ pub enum ErrorKind {
 
     /// An error got returned from the sqlite crate
     #[cfg(feature = "sqlite")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -68,7 +64,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cfg_if::cfg_if! {
             if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
+                if let Some(backtrace) = &self.backtrack {
                     fmt::Display::fmt(&self.kind, f)?;
                     fmt::Debug::fmt(backtrace, f)
                 } else {
@@ -93,7 +89,7 @@ impl From<ErrorKind> for Error {
 
 impl From<ProtoError> for Error {
     fn from(e: ProtoError) -> Self {
-        match *e.kind() {
+        match e.kind() {
             ProtoErrorKind::Timeout => ErrorKind::Timeout.into(),
             _ => ErrorKind::from(e).into(),
         }
@@ -101,7 +97,6 @@ impl From<ProtoError> for Error {
 }
 
 #[cfg(feature = "sqlite")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         ErrorKind::from(e).into()

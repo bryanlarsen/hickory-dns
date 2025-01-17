@@ -7,10 +7,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use proto::op::Query;
-use proto::rr::rdata::PTR;
-use proto::rr::{Name, RecordType};
-use proto::rr::{RData, Record};
+use crate::proto::op::Query;
+use crate::proto::rr::rdata::PTR;
+use crate::proto::rr::{Name, RecordType};
+use crate::proto::rr::{RData, Record};
 use tracing::warn;
 
 use crate::dns_lru;
@@ -138,8 +138,6 @@ impl Hosts {
     pub fn read_hosts_conf(&mut self, src: impl io::Read) -> io::Result<()> {
         use std::io::{BufRead, BufReader};
 
-        use proto::rr::domain::TryParseIp;
-
         // lines in the src should have the form `addr host1 host2 host3 ...`
         // line starts with `#` will be regarded with comments and ignored,
         // also empty line also will be ignored,
@@ -158,8 +156,8 @@ impl Hosts {
             if fields.len() < 2 {
                 continue;
             }
-            let addr = if let Some(a) = fields[0].try_parse_ip() {
-                a
+            let addr = if let Ok(a) = IpAddr::from_str(fields[0]) {
+                RData::from(a)
             } else {
                 warn!("could not parse an IP from hosts file");
                 continue;
@@ -203,14 +201,13 @@ fn hosts_path() -> &'static str {
 #[cfg(windows)]
 fn hosts_path() -> std::path::PathBuf {
     let system_root =
-        std::env::var_os("SystemRoot").expect("Environtment variable SystemRoot not found");
+        std::env::var_os("SystemRoot").expect("Environment variable SystemRoot not found");
     let system_root = Path::new(&system_root);
     system_root.join("System32\\drivers\\etc\\hosts")
 }
 
 /// parse configuration from `path`
 #[cfg(any(unix, windows))]
-#[cfg_attr(docsrs, doc(cfg(any(unix, windows))))]
 pub(crate) fn read_hosts_conf<P: AsRef<Path>>(path: P) -> io::Result<Hosts> {
     use std::fs::File;
 
@@ -245,7 +242,7 @@ mod tests {
             .map(ToOwned::to_owned)
             .collect::<Vec<RData>>();
 
-        assert_eq!(rdatas, vec![RData::A(Ipv4Addr::new(127, 0, 0, 1).into())]);
+        assert_eq!(rdatas, vec![RData::A(Ipv4Addr::LOCALHOST.into())]);
 
         let rdatas = hosts
             .lookup_static_host(&Query::query(name, RecordType::AAAA))

@@ -5,13 +5,23 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-#![cfg(feature = "hickory-resolver")]
+#![cfg(feature = "resolver")]
 
 //! Forwarding resolver related types
 
-mod authority;
-mod config;
+use serde::Deserialize;
 
-pub use self::authority::ForwardAuthority;
-pub use self::authority::ForwardLookup;
-pub use self::config::ForwardConfig;
+use crate::resolver::config::{NameServerConfigGroup, ResolverOpts};
+
+mod authority;
+pub use authority::{ForwardAuthority, ForwardLookup};
+
+/// Configuration for file based zones
+#[derive(Clone, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardConfig {
+    /// upstream name_server configurations
+    pub name_servers: NameServerConfigGroup,
+    /// Resolver options
+    pub options: Option<ResolverOpts>,
+}

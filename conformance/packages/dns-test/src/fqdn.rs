@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use crate::{Error, Result};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct FQDN {
     inner: Cow<'static, str>,
 }
@@ -32,6 +32,14 @@ impl FQDN {
 
     pub const TEST_TLD: FQDN = FQDN {
         inner: Cow::Borrowed("testing."),
+    };
+
+    pub const COM_TLD: FQDN = FQDN {
+        inner: Cow::Borrowed("com."),
+    };
+
+    pub const EDE_DOT_COM: FQDN = FQDN {
+        inner: Cow::Borrowed("extended-dns-errors.com."),
     };
 
     pub const TEST_DOMAIN: FQDN = FQDN {

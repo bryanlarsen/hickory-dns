@@ -17,9 +17,9 @@ use std::borrow::Borrow;
 use std::cmp::{Ordering, PartialEq};
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
-use tinyvec::TinyVec;
 
-use idna;
+use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
+use tinyvec::TinyVec;
 use tracing::debug;
 
 use crate::error::*;
@@ -60,15 +60,15 @@ impl Label {
             return Self::from_ascii(s);
         }
 
-        match idna::Config::default()
-            .use_std3_ascii_rules(true)
-            .transitional_processing(true)
-            // length don't exceding 63 is done in `from_ascii`
-            // on puny encoded string
-            // idna error are opaque so early failure is not possible.
-            .verify_dns_length(false)
-            .to_ascii(s)
-        {
+        // length don't exceeding 63 is done in `from_ascii`
+        // on puny encoded string
+        // idna error are opaque so early failure is not possible.
+        match Uts46::new().to_ascii(
+            s.as_bytes(),
+            AsciiDenyList::STD3,
+            Hyphens::Allow,
+            DnsLength::Ignore,
+        ) {
             Ok(puny) => Self::from_ascii(&puny),
             e => Err(format!("Label contains invalid characters: {e:?}").into()),
         }
@@ -124,7 +124,7 @@ impl Label {
         self.as_bytes() == WILDCARD
     }
 
-    /// Returns the lenght in bytes of this label
+    /// Returns the length in bytes of this label
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -245,11 +245,8 @@ impl Display for Label {
         if self.as_bytes().starts_with(IDNA_PREFIX) {
             // this should never be outside the ascii codes...
             let label = String::from_utf8_lossy(self.borrow());
-            let (label, e) = idna::Config::default()
-                .use_std3_ascii_rules(false)
-                .transitional_processing(false)
-                .verify_dns_length(false)
-                .to_unicode(&label);
+            let (label, e) =
+                Uts46::new().to_unicode(label.as_bytes(), AsciiDenyList::EMPTY, Hyphens::Allow);
 
             if e.is_ok() {
                 return f.write_str(&label);
@@ -332,7 +329,7 @@ pub trait IntoLabel: Sized {
     fn into_label(self) -> ProtoResult<Label>;
 }
 
-impl<'a> IntoLabel for &'a Label {
+impl IntoLabel for &Label {
     fn into_label(self) -> ProtoResult<Label> {
         Ok(self.clone())
     }
@@ -344,7 +341,7 @@ impl IntoLabel for Label {
     }
 }
 
-impl<'a> IntoLabel for &'a str {
+impl IntoLabel for &str {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_utf8(self)
     }
@@ -356,7 +353,7 @@ impl IntoLabel for String {
     }
 }
 
-impl<'a> IntoLabel for &'a [u8] {
+impl IntoLabel for &[u8] {
     fn into_label(self) -> ProtoResult<Label> {
         Label::from_raw_bytes(self)
     }
@@ -405,8 +402,8 @@ mod tests {
         // poor man debug since ProtoResult don't implement Partial Eq due to ssl errors.
         eprintln!("{error:?}");
         assert!(error.is_err());
-        match *error.unwrap_err().kind() {
-            ProtoErrorKind::LabelBytesTooLong(n) if n == len => (),
+        match error.unwrap_err().kind() {
+            ProtoErrorKind::LabelBytesTooLong(n) if *n == len => (),
             ProtoErrorKind::LabelBytesTooLong(e) => {
                 panic!(
                     "LabelTooLongError error don't report expected size {} of the label provided.",
@@ -436,7 +433,7 @@ mod tests {
     fn test_label_too_long_utf8_puny_emoji_mixed() {
         // too long mixed 65
         // Something international to say
-        // "Hello I like automn coffee 🦀 interresting"
+        // "Hello I like automn coffee 🦀 interesting"
         let emoji_case = "こんにちは-I-mögen-jesień-café-🦀-intéressant";
         let error = Label::from_utf8(emoji_case);
         assert_panic_label_too_long(error, 65);

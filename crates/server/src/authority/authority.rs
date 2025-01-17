@@ -10,26 +10,21 @@
 use cfg_if::cfg_if;
 use std::fmt;
 
-#[cfg(feature = "dnssec")]
-use hickory_proto::error::ProtoError;
-
 use crate::{
     authority::{LookupError, LookupObject, MessageRequest, UpdateResult, ZoneType},
     proto::rr::{LowerName, RecordSet, RecordType, RrsetRecords},
     server::RequestInfo,
 };
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 use crate::{
-    config::dnssec::NxProofKind,
+    dnssec::NxProofKind,
     proto::{
-        error::ProtoResult,
-        rr::{
-            dnssec::{
-                rdata::key::KEY, Digest, DnsSecResult, Nsec3HashAlgorithm, SigSigner,
-                SupportedAlgorithms,
-            },
-            Name,
+        dnssec::{
+            rdata::key::KEY, ring::Digest, DnsSecResult, Nsec3HashAlgorithm, SigSigner,
+            SupportedAlgorithms,
         },
+        rr::Name,
+        ProtoError,
     },
 };
 
@@ -40,15 +35,14 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LookupOptions {
     dnssec_ok: bool,
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     supported_algorithms: SupportedAlgorithms,
 }
 
 /// Lookup Options for the request to the authority
 impl LookupOptions {
     /// Return a new LookupOptions
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     pub fn for_dnssec(dnssec_ok: bool, supported_algorithms: SupportedAlgorithms) -> Self {
         Self {
             dnssec_ok,
@@ -71,8 +65,7 @@ impl LookupOptions {
     }
 
     /// Specify the algorithms for which DNSSEC records should be returned
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     pub fn set_supported_algorithms(self, val: SupportedAlgorithms) -> Self {
         Self {
             supported_algorithms: val,
@@ -81,8 +74,7 @@ impl LookupOptions {
     }
 
     /// The algorithms for which DNSSEC records should be returned
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     pub fn supported_algorithms(&self) -> SupportedAlgorithms {
         self.supported_algorithms
     }
@@ -93,7 +85,7 @@ impl LookupOptions {
         record_set: &'r RecordSet,
     ) -> RrsetRecords<'r> {
         cfg_if! {
-            if #[cfg(feature = "dnssec")] {
+            if #[cfg(feature = "dnssec-ring")] {
                 record_set.records(
                     self.dnssec_ok(),
                     self.supported_algorithms(),
@@ -128,20 +120,21 @@ pub trait Authority: Send + Sync {
     /// Get the origin of this zone, i.e. example.com is the origin for www.example.com
     fn origin(&self) -> &LowerName;
 
-    /// Looks up all Resource Records matching the giving `Name` and `RecordType`.
+    /// Looks up all Resource Records matching the given `Name` and `RecordType`.
     ///
     /// # Arguments
     ///
-    /// * `name` - The `Name`, label, to lookup.
-    /// * `rtype` - The `RecordType`, to lookup. `RecordType::ANY` will return all records matching
+    /// * `name` - The name to look up.
+    /// * `rtype` - The `RecordType` to look up. `RecordType::ANY` will return all records matching
     ///             `name`. `RecordType::AXFR` will return all record types except `RecordType::SOA`
     ///             due to the requirements that on zone transfers the `RecordType::SOA` must both
     ///             precede and follow all other records.
-    /// * `is_secure` - If the DO bit is set on the EDNS OPT record, then return RRSIGs as well.
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     ///
     /// # Return value
     ///
-    /// None if there are no matching records, otherwise a `Vec` containing the found records.
+    /// A LookupControlFlow containing the lookup that should be returned to the client.
     async fn lookup(
         &self,
         name: &LowerName,
@@ -149,17 +142,52 @@ pub trait Authority: Send + Sync {
         lookup_options: LookupOptions,
     ) -> LookupControlFlow<Self::Lookup>;
 
+    /// Consulting lookup for all Resource Records matching the given `Name` and `RecordType`.
+    /// This will be called in a chained authority configuration after an authority in the chain
+    /// has returned a lookup with a LookupControlFlow::Continue action. Every other authority in
+    /// the chain will be called via this consult method, until one either returns a
+    /// LookupControlFlow::Break action, or all authorities have been consulted.  The authority that
+    /// generated the primary lookup (the one returned via 'lookup') will not be consulted.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name to look up.
+    /// * `rtype` - The `RecordType` to look up. `RecordType::ANY` will return all records matching
+    ///             `name`. `RecordType::AXFR` will return all record types except `RecordType::SOA`
+    ///             due to the requirements that on zone transfers the `RecordType::SOA` must both
+    ///             precede and follow all other records.
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
+    /// * `last_result` - The lookup returned by a previous authority in a chained configuration.
+    ///                   If a subsequent authority does not modify this lookup, it will be returned
+    ///                   to the client after consulting all authorities in the chain.
+    ///
+    /// # Return value
+    ///
+    /// A LookupControlFlow containing the lookup that should be returned to the client.  This can
+    /// be the same last_result that was passed in, or a new lookup, depending on the logic of the
+    /// authority in question.
+    async fn consult(
+        &self,
+        _name: &LowerName,
+        _rtype: RecordType,
+        _lookup_options: LookupOptions,
+        last_result: LookupControlFlow<Box<dyn LookupObject>>,
+    ) -> LookupControlFlow<Box<dyn LookupObject>> {
+        last_result
+    }
+
     /// Using the specified query, perform a lookup against this zone.
     ///
     /// # Arguments
     ///
-    /// * `query` - the query to perform the lookup with.
-    /// * `is_secure` - if true, then RRSIG records (if this is a secure zone) will be returned.
+    /// * `request` - the query to perform the lookup with.
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     ///
     /// # Return value
     ///
-    /// Returns a vector containing the results of the query, it will be empty if not found. If
-    ///  `is_secure` is true, in the case of no records found then NSEC records will be returned.
+    /// A LookupControlFlow containing the lookup that should be returned to the client.
     async fn search(
         &self,
         request: RequestInfo<'_>,
@@ -178,7 +206,8 @@ pub trait Authority: Send + Sync {
     ///
     /// * `name` - given this name (i.e. the lookup name), return the NSEC record that is less than
     ///            this
-    /// * `is_secure` - if true then it will return RRSIG records as well
+    /// * `lookup_options` - Query-related lookup options (e.g., DNSSEC DO bit, supported hash
+    ///                      algorithms, etc.)
     async fn get_nsec_records(
         &self,
         name: &LowerName,
@@ -186,7 +215,7 @@ pub trait Authority: Send + Sync {
     ) -> LookupControlFlow<Self::Lookup>;
 
     /// Return the NSEC3 records based on the information available for a query.
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     async fn get_nsec3_records(
         &self,
         info: Nsec3QueryInfo<'_>,
@@ -210,13 +239,12 @@ pub trait Authority: Send + Sync {
     }
 
     /// Returns the kind of non-existence proof used for this zone.
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     fn nx_proof_kind(&self) -> Option<&NxProofKind>;
 }
 
 /// Extension to Authority to allow for DNSSEC features
-#[cfg(feature = "dnssec")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+#[cfg(feature = "dnssec-ring")]
 #[async_trait::async_trait]
 pub trait DnssecAuthority: Authority {
     /// Add a (Sig0) key that is authorized to perform updates against this authority
@@ -285,6 +313,15 @@ impl<T, E> LookupControlFlow<T, E> {
     pub fn is_break(&self) -> bool {
         matches!(self, Self::Break(_))
     }
+
+    /// Maps inner Ok(T) and Err(E) to Some(Result<T,E>) and Skip to None
+    pub fn map_result(self) -> Option<Result<T, E>> {
+        match self {
+            Self::Continue(Ok(lookup)) | Self::Break(Ok(lookup)) => Some(Ok(lookup)),
+            Self::Continue(Err(e)) | Self::Break(Err(e)) => Some(Err(e)),
+            Self::Skip => None,
+        }
+    }
 }
 
 impl<T: LookupObject + 'static, E: std::fmt::Display> LookupControlFlow<T, E> {
@@ -314,8 +351,8 @@ impl<T: LookupObject + 'static, E: std::fmt::Display> LookupControlFlow<T, E> {
     pub fn unwrap(self) -> T {
         match self {
             Self::Continue(Ok(ok)) | Self::Break(Ok(ok)) => ok,
-            Self::Continue(Err(ref e)) | Self::Break(Err(ref e)) => {
-                panic!("lookupcontrolflow::unwrap() called on unexpected variant {self}: {e}");
+            Self::Continue(Err(e)) | Self::Break(Err(e)) => {
+                panic!("lookupcontrolflow::unwrap() called on unexpected variant _(Err(_)): {e}");
             }
             _ => {
                 panic!("lookupcontrolflow::unwrap() called on unexpected variant: {self}");
@@ -396,7 +433,7 @@ impl<T: LookupObject + 'static, E: std::fmt::Display> LookupControlFlow<T, E> {
 }
 
 /// Information required to compute the NSEC3 records that should be sent for a query.
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 pub struct Nsec3QueryInfo<'q> {
     /// The queried name.
     pub qname: &'q LowerName,
@@ -412,14 +449,14 @@ pub struct Nsec3QueryInfo<'q> {
     pub iterations: u16,
 }
 
-#[cfg(feature = "dnssec")]
-impl<'q> Nsec3QueryInfo<'q> {
+#[cfg(feature = "dnssec-ring")]
+impl Nsec3QueryInfo<'_> {
     /// Computes the hash of a given name.
-    pub(crate) fn hash_name(&self, name: &Name) -> ProtoResult<Digest> {
+    pub(crate) fn hash_name(&self, name: &Name) -> Result<Digest, ProtoError> {
         self.algorithm.hash(self.salt, name, self.iterations)
     }
 
-    /// Computes the hashed owner name from a given name. This is, the hash of the given name,
+    /// Computes the hashed owner name from a given name. That is, the hash of the given name,
     /// followed by the zone name.
     pub(crate) fn get_hashed_owner_name(
         &self,

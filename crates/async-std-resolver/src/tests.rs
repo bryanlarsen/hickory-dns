@@ -2,12 +2,13 @@
 
 use hickory_resolver::name_server::GenericConnection;
 use hickory_resolver::testing;
+use hickory_resolver::LookupFuture;
+use test_support::subscribe;
 
 use crate::config::{ResolverConfig, ResolverOpts};
-use crate::lookup::LookupFuture;
 use crate::lookup_ip::LookupIpFuture;
+use crate::proto::runtime::Executor;
 use crate::proto::xfer::DnsRequest;
-use crate::proto::Executor;
 use crate::runtime::AsyncStdConnectionProvider;
 use crate::AsyncStdResolver;
 
@@ -52,17 +53,6 @@ fn test_lookup_cloudflare() {
     let io_loop = AsyncStdConnectionProvider::new();
     lookup_test::<AsyncStdConnectionProvider, AsyncStdConnectionProvider>(
         ResolverConfig::cloudflare(),
-        io_loop.clone(),
-        io_loop,
-    )
-}
-
-#[test]
-fn test_lookup_quad9() {
-    use testing::lookup_test;
-    let io_loop = AsyncStdConnectionProvider::new();
-    lookup_test::<AsyncStdConnectionProvider, AsyncStdConnectionProvider>(
-        ResolverConfig::quad9(),
         io_loop.clone(),
         io_loop,
     )
@@ -139,6 +129,7 @@ fn test_large_ndots() {
 #[test]
 fn test_domain_search() {
     use testing::domain_search_test;
+    subscribe();
     let io_loop = AsyncStdConnectionProvider::new();
     domain_search_test::<AsyncStdConnectionProvider, AsyncStdConnectionProvider>(
         io_loop.clone(),

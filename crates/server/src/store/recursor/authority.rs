@@ -9,29 +9,34 @@ use std::{io, path::Path, time::Instant};
 
 use tracing::{debug, info};
 
-#[cfg(feature = "dnssec")]
-use crate::{authority::Nsec3QueryInfo, config::dnssec::NxProofKind, proto::rr::dnssec::Proof};
 use crate::{
     authority::{
-        Authority, DnssecSummary, LookupControlFlow, LookupError, LookupObject, LookupOptions,
-        MessageRequest, UpdateResult, ZoneType,
+        Authority, LookupControlFlow, LookupError, LookupObject, LookupOptions, MessageRequest,
+        UpdateResult, ZoneType,
     },
     proto::{
         op::{Query, ResponseCode},
         rr::{LowerName, Name, Record, RecordType},
+        xfer::Protocol,
     },
     recursor::Recursor,
     resolver::{
-        config::{NameServerConfig, NameServerConfigGroup, Protocol},
+        config::{NameServerConfig, NameServerConfigGroup},
         lookup::Lookup,
     },
     server::RequestInfo,
     store::recursor::RecursiveConfig,
 };
+#[cfg(feature = "dnssec-ring")]
+use crate::{
+    authority::{DnssecSummary, Nsec3QueryInfo},
+    dnssec::NxProofKind,
+    proto::dnssec::Proof,
+};
 
-/// An authority that will forward resolutions to upstream resolvers.
+/// An authority that performs recursive resolutions.
 ///
-/// This uses the hickory-resolver for resolving requests.
+/// This uses the hickory-recursor crate for resolving requests.
 pub struct RecursiveAuthority {
     origin: LowerName,
     recursor: Recursor,
@@ -59,6 +64,7 @@ impl RecursiveAuthority {
                 socket_addr,
                 protocol: Protocol::Tcp,
                 tls_dns_name: None,
+                http_endpoint: None,
                 trust_negative_responses: false,
                 #[cfg(feature = "dns-over-rustls")]
                 tls_config: None,
@@ -69,6 +75,7 @@ impl RecursiveAuthority {
                 socket_addr,
                 protocol: Protocol::Udp,
                 tls_dns_name: None,
+                http_endpoint: None,
                 trust_negative_responses: false,
                 #[cfg(feature = "dns-over-rustls")]
                 tls_config: None,
@@ -78,15 +85,25 @@ impl RecursiveAuthority {
 
         let mut builder = Recursor::builder();
         if let Some(ns_cache_size) = config.ns_cache_size {
-            builder.ns_cache_size(ns_cache_size);
+            builder = builder.ns_cache_size(ns_cache_size);
         }
         if let Some(record_cache_size) = config.record_cache_size {
-            builder.record_cache_size(record_cache_size);
+            builder = builder.record_cache_size(record_cache_size);
         }
 
         let recursor = builder
             .dnssec_policy(config.dnssec_policy.load()?)
-            .do_not_query(&config.do_not_query)
+            .nameserver_filter(config.allow_server.iter(), config.deny_server.iter())
+            .recursion_limit(match config.recursion_limit {
+                0 => None,
+                limit => Some(limit),
+            })
+            .ns_recursion_limit(match config.ns_recursion_limit {
+                0 => None,
+                limit => Some(limit),
+            })
+            .avoid_local_udp_ports(config.avoid_local_udp_ports.clone())
+            .ttl_config(config.cache_policy.clone())
             .build(roots)
             .map_err(|e| format!("failed to initialize recursor: {e}"))?;
 
@@ -101,9 +118,9 @@ impl RecursiveAuthority {
 impl Authority for RecursiveAuthority {
     type Lookup = RecursiveLookup;
 
-    /// Always Recursive
+    /// Always External
     fn zone_type(&self) -> ZoneType {
-        ZoneType::Hint
+        ZoneType::External
     }
 
     /// Always false for Forward zones
@@ -176,7 +193,7 @@ impl Authority for RecursiveAuthority {
         ))))
     }
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     async fn get_nsec3_records(
         &self,
         _info: Nsec3QueryInfo<'_>,
@@ -188,7 +205,7 @@ impl Authority for RecursiveAuthority {
         ))))
     }
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     fn nx_proof_kind(&self) -> Option<&NxProofKind> {
         None
     }
@@ -209,6 +226,7 @@ impl LookupObject for RecursiveLookup {
         None
     }
 
+    #[cfg(feature = "dnssec-ring")]
     fn dnssec_summary(&self) -> DnssecSummary {
         let mut all_secure = None;
         for record in self.0.records().iter() {

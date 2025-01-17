@@ -1,3 +1,4 @@
+use std::future::{poll_fn, Future};
 use std::net::*;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -8,17 +9,16 @@ use std::sync::{
 use std::task::Poll;
 
 use futures::executor::block_on;
-use futures::{future, Future};
 
 use hickory_integration::mock_client::*;
-use hickory_proto::error::{ProtoError, ProtoErrorKind};
 use hickory_proto::op::{Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::xfer::{DnsHandle, DnsResponse, FirstAnswer};
-use hickory_resolver::config::*;
+use hickory_proto::xfer::{DnsHandle, DnsResponse, FirstAnswer, Protocol};
+use hickory_proto::{ProtoError, ProtoErrorKind};
+use hickory_resolver::config::{NameServerConfig, ResolverOpts, ServerOrderingStrategy};
 use hickory_resolver::name_server::{NameServer, NameServerPool};
 
-const DEFAULT_SERVER_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const DEFAULT_SERVER_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 type MockedNameServer<O> = NameServer<MockConnProvider<O>>;
 type MockedNameServerPool<O> = NameServerPool<MockConnProvider<O>>;
@@ -82,6 +82,7 @@ fn mock_nameserver_on_send_nx<O: OnSend + Unpin>(
             socket_addr: SocketAddr::new(addr, 0),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses,
             #[cfg(any(feature = "dns-over-rustls", feature = "dns-over-https-rustls"))]
             tls_config: None,
@@ -118,7 +119,7 @@ fn mock_nameserver_pool_on_send<O: OnSend + Unpin>(
 fn test_datagram() {
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
     let tcp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 2));
 
     let udp_message = message(query.clone(), vec![udp_record.clone()], vec![], vec![]);
@@ -192,7 +193,7 @@ fn test_datagram_stream_upgrade_on_truncation_despite_udp() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
     let tcp_record1 = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 2));
     let tcp_record2 = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 3));
 
@@ -463,11 +464,13 @@ fn test_trust_nx_responses_fails() {
         true,
     );
 
+    let mut opts = ResolverOpts::default();
+    opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
     let pool = mock_nameserver_pool(
         vec![fail_nameserver, succeed_nameserver],
         vec![],
         None,
-        ResolverOpts::default(),
+        opts,
     );
 
     // Lookup on UDP should fail, since we trust nx responses.
@@ -613,7 +616,7 @@ fn test_user_provided_server_order() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let preferred_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let preferred_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
     let secondary_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 2));
 
     let preferred_server_records = vec![preferred_record; 10];
@@ -690,7 +693,10 @@ fn test_return_error_from_highest_priority_nameserver() {
             mock_nameserver(vec![Err(response)], ResolverOpts::default())
         })
         .collect();
-    let pool = mock_nameserver_pool(name_servers, vec![], None, ResolverOpts::default());
+
+    let mut opts = ResolverOpts::default();
+    opts.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
+    let pool = mock_nameserver_pool(name_servers, vec![], None, opts);
 
     let request = message(query, vec![], vec![], vec![]);
     let future = pool.send(request).first_answer();
@@ -750,7 +756,7 @@ async fn wait_for<E>(
 where
     E: From<ProtoError> + Send + 'static,
 {
-    future::poll_fn(move |_| {
+    poll_fn(move |_| {
         if barrier.load(Ordering::Relaxed) > 0 {
             Poll::Pending
         } else {
@@ -766,6 +772,7 @@ where
 #[test]
 fn test_concurrent_requests_2_conns() {
     let mut options = ResolverOpts::default();
+    options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
 
     // there are only 2 conns, so this matches that count
     options.num_concurrent_reqs = 2;
@@ -776,7 +783,7 @@ fn test_concurrent_requests_2_conns() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
 
     let udp_message = message(query.clone(), vec![udp_record.clone()], vec![], vec![]);
 
@@ -809,6 +816,7 @@ fn test_concurrent_requests_2_conns() {
 #[test]
 fn test_concurrent_requests_more_than_conns() {
     let mut options = ResolverOpts::default();
+    options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
 
     // there are only two conns, but this requests 3 concurrent requests, only 2 called
     options.num_concurrent_reqs = 3;
@@ -819,7 +827,7 @@ fn test_concurrent_requests_more_than_conns() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
 
     let udp_message = message(query.clone(), vec![udp_record.clone()], vec![], vec![]);
 
@@ -862,7 +870,7 @@ fn test_concurrent_requests_1_conn() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
 
     let udp_message = message(query.clone(), vec![udp_record.clone()], vec![], vec![]);
 
@@ -905,7 +913,7 @@ fn test_concurrent_requests_0_conn() {
 
     let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
 
-    let udp_record = v4_record(query.name().clone(), Ipv4Addr::new(127, 0, 0, 1));
+    let udp_record = v4_record(query.name().clone(), Ipv4Addr::LOCALHOST);
 
     let udp_message = message(query.clone(), vec![udp_record.clone()], vec![], vec![]);
 

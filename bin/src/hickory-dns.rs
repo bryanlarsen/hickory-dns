@@ -38,18 +38,19 @@
 
 use std::{
     env, fmt,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    io::Error,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use clap::Parser;
+use socket2::{Domain, Socket, Type};
 use time::OffsetDateTime;
 use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
 };
-use tracing::{debug, error, info, warn, Event, Subscriber};
+use tracing::{error, info, warn, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{format, FmtContext, FormatEvent, FormatFields, FormattedFields},
     layer::SubscriberExt,
@@ -57,233 +58,10 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use hickory_proto::rr::Name;
+use hickory_dns::Config;
 #[cfg(feature = "dns-over-tls")]
-use hickory_server::config::dnssec::{self, TlsCertConfig};
-#[cfg(feature = "resolver")]
-use hickory_server::store::forwarder::ForwardAuthority;
-#[cfg(feature = "recursor")]
-use hickory_server::store::recursor::RecursiveAuthority;
-#[cfg(feature = "sqlite")]
-use hickory_server::store::sqlite::{SqliteAuthority, SqliteConfig};
-use hickory_server::{
-    authority::{AuthorityObject, Catalog, ZoneType},
-    config::{Config, ZoneConfig},
-    server::ServerFuture,
-    store::{
-        file::{FileAuthority, FileConfig},
-        StoreConfig,
-    },
-};
-
-#[cfg(feature = "dnssec")]
-use {hickory_proto::rr::dnssec::rdata::key::KeyUsage, hickory_server::authority::DnssecAuthority};
-
-#[cfg(feature = "dnssec")]
-async fn load_keys<A, L>(
-    authority: &mut A,
-    zone_name: Name,
-    zone_config: &ZoneConfig,
-) -> Result<(), String>
-where
-    A: DnssecAuthority<Lookup = L>,
-    L: Send + Sync + Sized + 'static,
-{
-    if zone_config.is_dnssec_enabled() {
-        for key_config in zone_config.get_keys() {
-            info!(
-                "adding key to zone: {:?}, is_zsk: {}, is_auth: {}",
-                key_config.key_path(),
-                key_config.is_zone_signing_key(),
-                key_config.is_zone_update_auth()
-            );
-            if key_config.is_zone_signing_key() {
-                let zone_signer = key_config.try_into_signer(zone_name.clone()).map_err(|e| {
-                    format!("failed to load key: {:?} msg: {}", key_config.key_path(), e)
-                })?;
-                authority
-                    .add_zone_signing_key(zone_signer)
-                    .await
-                    .map_err(|err| format!("failed to add zone signing key to authority: {err}"))?;
-            }
-            if key_config.is_zone_update_auth() {
-                let update_auth_signer =
-                    key_config.try_into_signer(zone_name.clone()).map_err(|e| {
-                        format!("failed to load key: {:?} msg: {}", key_config.key_path(), e)
-                    })?;
-                let public_key = update_auth_signer
-                    .key()
-                    .to_sig0key_with_usage(update_auth_signer.algorithm(), KeyUsage::Host)
-                    .map_err(|err| format!("failed to get sig0 key: {err}"))?;
-                authority
-                    .add_update_auth_key(zone_name.clone(), public_key)
-                    .await
-                    .map_err(|err| format!("failed to update auth key to authority: {err}"))?;
-            }
-        }
-
-        let zone_name = zone_config
-            .get_zone()
-            .map_err(|err| format!("failed to read zone name: {err}"))?;
-        info!("signing zone: {zone_name}");
-        authority
-            .secure_zone()
-            .await
-            .map_err(|err| format!("failed to sign zone {zone_name}: {err}"))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "dnssec"))]
-#[allow(clippy::unnecessary_wraps)]
-async fn load_keys<T>(
-    _authority: &mut T,
-    _zone_name: Name,
-    _zone_config: &ZoneConfig,
-) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg_attr(not(feature = "dnssec"), allow(unused_mut, unused))]
-#[warn(clippy::wildcard_enum_match_arm)] // make sure all cases are handled despite of non_exhaustive
-async fn load_zone(
-    zone_dir: &Path,
-    zone_config: &ZoneConfig,
-) -> Result<Box<dyn AuthorityObject>, String> {
-    debug!("loading zone with config: {:#?}", zone_config);
-
-    let zone_name: Name = zone_config
-        .get_zone()
-        .map_err(|err| format!("failed to read zone name: {err}"))?;
-    let zone_name_for_signer = zone_name.clone();
-    let zone_path: Option<String> = zone_config.file.clone();
-    let zone_type: ZoneType = zone_config.get_zone_type();
-    let is_axfr_allowed = zone_config.is_axfr_allowed();
-    #[allow(unused_variables)]
-    let is_dnssec_enabled = zone_config.is_dnssec_enabled();
-
-    if zone_config.is_update_allowed() {
-        warn!("allow_update is deprecated in [[zones]] section, it belongs in [[zones.stores]]");
-    }
-
-    // load the zone
-    let authority: Box<dyn AuthorityObject> = match zone_config.stores {
-        #[cfg(feature = "sqlite")]
-        Some(StoreConfig::Sqlite(ref config)) => {
-            if zone_path.is_some() {
-                warn!("ignoring [[zones.file]] instead using [[zones.stores.zone_file_path]]");
-            }
-
-            let mut authority = SqliteAuthority::try_from_config(
-                zone_name,
-                zone_type,
-                is_axfr_allowed,
-                is_dnssec_enabled,
-                Some(zone_dir),
-                config,
-                #[cfg(feature = "dnssec")]
-                zone_config.nx_proof_kind.clone(),
-            )
-            .await?;
-
-            // load any keys for the Zone, if it is a dynamic update zone, then keys are required
-            load_keys(&mut authority, zone_name_for_signer, zone_config).await?;
-            Box::new(Arc::new(authority)) as Box<dyn AuthorityObject>
-        }
-        Some(StoreConfig::File(ref config)) => {
-            if zone_path.is_some() {
-                warn!("ignoring [[zones.file]] instead using [[zones.stores.zone_file_path]]");
-            }
-
-            let mut authority = FileAuthority::try_from_config(
-                zone_name,
-                zone_type,
-                is_axfr_allowed,
-                Some(zone_dir),
-                config,
-                #[cfg(feature = "dnssec")]
-                zone_config.nx_proof_kind.clone(),
-            )?;
-
-            // load any keys for the Zone, if it is a dynamic update zone, then keys are required
-            load_keys(&mut authority, zone_name_for_signer, zone_config).await?;
-            Box::new(Arc::new(authority)) as Box<dyn AuthorityObject>
-        }
-        #[cfg(feature = "resolver")]
-        Some(StoreConfig::Forward(ref config)) => {
-            let forwarder = ForwardAuthority::try_from_config(zone_name, zone_type, config)?;
-
-            Box::new(Arc::new(forwarder)) as Box<dyn AuthorityObject>
-        }
-        #[cfg(feature = "recursor")]
-        Some(StoreConfig::Recursor(ref config)) => {
-            let recursor =
-                RecursiveAuthority::try_from_config(zone_name, zone_type, config, Some(zone_dir));
-            let authority = recursor.await?;
-
-            Box::new(Arc::new(authority)) as Box<dyn AuthorityObject>
-        }
-        #[cfg(feature = "sqlite")]
-        None if zone_config.is_update_allowed() => {
-            warn!(
-                "using deprecated SQLite load configuration, please move to [[zones.stores]] form"
-            );
-            let zone_file_path = zone_path.ok_or("file is a necessary parameter of zone_config")?;
-            let journal_file_path = PathBuf::from(zone_file_path.clone())
-                .with_extension("jrnl")
-                .to_str()
-                .map(String::from)
-                .ok_or("non-unicode characters in file name")?;
-
-            let config = SqliteConfig {
-                zone_file_path,
-                journal_file_path,
-                allow_update: zone_config.is_update_allowed(),
-            };
-
-            let mut authority = SqliteAuthority::try_from_config(
-                zone_name,
-                zone_type,
-                is_axfr_allowed,
-                is_dnssec_enabled,
-                Some(zone_dir),
-                &config,
-                #[cfg(feature = "dnssec")]
-                zone_config.nx_proof_kind.clone(),
-            )
-            .await?;
-
-            // load any keys for the Zone, if it is a dynamic update zone, then keys are required
-            load_keys(&mut authority, zone_name_for_signer, zone_config).await?;
-            Box::new(Arc::new(authority)) as Box<dyn AuthorityObject>
-        }
-        None => {
-            let config = FileConfig {
-                zone_file_path: zone_path.ok_or("file is a necessary parameter of zone_config")?,
-            };
-
-            let mut authority = FileAuthority::try_from_config(
-                zone_name,
-                zone_type,
-                is_axfr_allowed,
-                Some(zone_dir),
-                &config,
-                #[cfg(feature = "dnssec")]
-                zone_config.nx_proof_kind.clone(),
-            )?;
-
-            // load any keys for the Zone, if it is a dynamic update zone, then keys are required
-            load_keys(&mut authority, zone_name_for_signer, zone_config).await?;
-            Box::new(Arc::new(authority)) as Box<dyn AuthorityObject>
-        }
-        Some(_) => {
-            panic!("unrecognized authority type, check enabled features");
-        }
-    };
-
-    info!("zone successfully loaded: {}", zone_config.get_zone()?);
-    Ok(authority)
-}
+use hickory_dns::TlsCertConfig;
+use hickory_server::{authority::Catalog, server::ServerFuture};
 
 /// Cli struct for all options managed with clap derive api.
 #[derive(Debug, Parser)]
@@ -406,7 +184,7 @@ fn run() -> Result<(), String> {
 
     let config = Config::read_config(config_path)
         .map_err(|err| format!("failed to read config file from {config_path:?}: {err}"))?;
-    let directory_config = config.get_directory().to_path_buf();
+    let directory_config = config.directory().to_path_buf();
     let zonedir = args.zonedir.clone();
     let zone_dir: PathBuf = zonedir
         .as_ref()
@@ -424,22 +202,22 @@ fn run() -> Result<(), String> {
 
     let mut catalog: Catalog = Catalog::new();
     // configure our server based on the config_path
-    for zone in config.get_zones() {
+    for zone in config.zones() {
         let zone_name = zone
-            .get_zone()
+            .zone()
             .map_err(|err| format!("failed to read zone name from {config_path:?}: {err}"))?;
 
-        match runtime.block_on(load_zone(&zone_dir, zone)) {
+        match runtime.block_on(zone.load(&zone_dir)) {
             Ok(authority) => catalog.upsert(zone_name.into(), authority),
             Err(err) => return Err(format!("could not load zone {zone_name}: {err}")),
         }
     }
 
     let v4addr = config
-        .get_listen_addrs_ipv4()
+        .listen_addrs_ipv4()
         .map_err(|err| format!("failed to parse IPv4 addresses from {config_path:?}: {err}"))?;
     let v6addr = config
-        .get_listen_addrs_ipv6()
+        .listen_addrs_ipv6()
         .map_err(|err| format!("failed to parse IPv6 addresses from {config_path:?}: {err}"))?;
     let mut listen_addrs: Vec<IpAddr> = v4addr
         .into_iter()
@@ -447,38 +225,35 @@ fn run() -> Result<(), String> {
         .chain(v6addr.into_iter().map(IpAddr::V6))
         .collect();
 
-    let listen_port: u16 = args.port.unwrap_or_else(|| config.get_listen_port());
+    let listen_port: u16 = args.port.unwrap_or_else(|| config.listen_port());
 
     if listen_addrs.is_empty() {
-        listen_addrs.push(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        listen_addrs.push(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        listen_addrs.push(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
     }
-    let sockaddrs: Vec<SocketAddr> = listen_addrs
-        .iter()
-        .flat_map(|x| (*x, listen_port).to_socket_addrs().unwrap())
-        .collect();
 
     if args.validate {
         info!("configuration files are validated");
         return Ok(());
     }
 
-    let deny_networks = config.get_deny_networks();
-    let allow_networks = config.get_allow_networks();
-    let tcp_request_timeout = config.get_tcp_request_timeout();
+    let deny_networks = config.deny_networks();
+    let allow_networks = config.allow_networks();
+    let tcp_request_timeout = config.tcp_request_timeout();
 
     // now, run the server, based on the config
     #[cfg_attr(not(feature = "dns-over-tls"), allow(unused_mut))]
     let mut server = ServerFuture::with_access(catalog, deny_networks, allow_networks);
 
-    if !args.disable_udp && !config.get_disable_udp() {
+    let _guard = runtime.enter();
+
+    if !args.disable_udp && !config.disable_udp() {
         // load all udp listeners
-        for udp_socket in &sockaddrs {
-            info!("binding UDP to {:?}", udp_socket);
-            let udp_socket = runtime
-                .block_on(UdpSocket::bind(udp_socket))
-                .map_err(|err| {
-                    format!("failed to bind to UDP socket address {udp_socket:?}: {err}")
-                })?;
+        for addr in &listen_addrs {
+            info!("binding UDP to {addr:?}");
+
+            let udp_socket = build_udp_socket(*addr, listen_port)
+                .map_err(|err| format!("failed to bind to UDP socket address {addr:?}: {err}"))?;
 
             info!(
                 "listening for UDP on {:?}",
@@ -487,23 +262,19 @@ fn run() -> Result<(), String> {
                     .map_err(|err| format!("failed to lookup local address: {err}"))?
             );
 
-            let _guard = runtime.enter();
             server.register_socket(udp_socket);
         }
     } else {
         info!("UDP protocol is disabled");
     }
 
-    if !args.disable_tcp && !config.get_disable_tcp() {
+    if !args.disable_tcp && !config.disable_tcp() {
         // load all tcp listeners
-        for tcp_listener in &sockaddrs {
-            info!("binding TCP to {:?}", tcp_listener);
-            let tcp_listener =
-                runtime
-                    .block_on(TcpListener::bind(tcp_listener))
-                    .map_err(|err| {
-                        format!("failed to bind to TCP socket address {tcp_listener:?}: {err}")
-                    })?;
+        for addr in &listen_addrs {
+            info!("binding TCP to {addr:?}");
+
+            let tcp_listener = build_tcp_listener(*addr, listen_port)
+                .map_err(|err| format!("failed to bind to TCP socket address {addr:?}: {err}"))?;
 
             info!(
                 "listening for TCP on {:?}",
@@ -512,7 +283,6 @@ fn run() -> Result<(), String> {
                     .map_err(|err| format!("failed to lookup local address: {err}"))?
             );
 
-            let _guard = runtime.enter();
             server.register_listener(tcp_listener, tcp_request_timeout);
         }
     } else {
@@ -524,9 +294,9 @@ fn run() -> Result<(), String> {
         feature = "dns-over-https-rustls",
         feature = "dns-over-quic"
     ))]
-    if let Some(tls_cert_config) = config.get_tls_cert() {
+    if let Some(tls_cert_config) = config.tls_cert() {
         #[cfg(feature = "dns-over-tls")]
-        if !args.disable_tls && !config.get_disable_tls() {
+        if !args.disable_tls && !config.disable_tls() {
             // setup TLS listeners
             config_tls(
                 &args,
@@ -535,14 +305,13 @@ fn run() -> Result<(), String> {
                 tls_cert_config,
                 &zone_dir,
                 &listen_addrs,
-                &runtime,
             )?;
         } else {
             info!("TLS protocol is disabled");
         }
 
         #[cfg(feature = "dns-over-https-rustls")]
-        if !args.disable_https && !config.get_disable_https() {
+        if !args.disable_https && !config.disable_https() {
             // setup HTTPS listeners
             config_https(
                 &args,
@@ -551,14 +320,13 @@ fn run() -> Result<(), String> {
                 tls_cert_config,
                 &zone_dir,
                 &listen_addrs,
-                &runtime,
             )?;
         } else {
             info!("HTTPS protocol is disabled");
         }
 
         #[cfg(feature = "dns-over-quic")]
-        if !args.disable_quic && !config.get_disable_quic() {
+        if !args.disable_quic && !config.disable_quic() {
             // setup QUIC listeners
             config_quic(
                 &args,
@@ -567,7 +335,6 @@ fn run() -> Result<(), String> {
                 tls_cert_config,
                 &zone_dir,
                 &listen_addrs,
-                &runtime,
             )?;
         } else {
             info!("QUIC protocol is disabled");
@@ -575,6 +342,17 @@ fn run() -> Result<(), String> {
     } else {
         info!("TLS certificates are not provided");
         info!("TLS related protocols (TLS, HTTPS and QUIC) are disabled")
+    }
+
+    // Drop privileges on Unix systems if running as root.
+    #[cfg(target_family = "unix")]
+    check_drop_privs(
+        config.user.as_deref().unwrap_or(DEFAULT_USER),
+        config.group.as_deref().unwrap_or(DEFAULT_GROUP),
+    )?;
+    #[cfg(not(target_family = "unix"))]
+    if config.user.is_some() || config.group.is_some() {
+        return Err("dropping privileges is only supported on Unix systems".to_string());
     }
 
     // config complete, starting!
@@ -612,35 +390,26 @@ fn config_tls(
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
-    runtime: &runtime::Runtime,
 ) -> Result<(), String> {
-    let tls_listen_port: u16 = args
-        .tls_port
-        .unwrap_or_else(|| config.get_tls_listen_port());
-    let tls_sockaddrs: Vec<SocketAddr> = listen_addrs
-        .iter()
-        .flat_map(|x| (*x, tls_listen_port).to_socket_addrs().unwrap())
-        .collect();
+    let tls_listen_port: u16 = args.tls_port.unwrap_or_else(|| config.tls_listen_port());
 
-    if tls_sockaddrs.is_empty() {
+    if listen_addrs.is_empty() {
         warn!("a tls certificate was specified, but no TLS addresses configured to listen on");
         return Ok(());
     }
 
-    for tls_listener in &tls_sockaddrs {
-        let tls_cert_path = tls_cert_config.get_path();
+    for addr in listen_addrs {
+        let tls_cert_path = &tls_cert_config.path;
         info!("loading cert for DNS over TLS: {tls_cert_path:?}");
 
-        let tls_cert = dnssec::load_cert(zone_dir, tls_cert_config).map_err(|err| {
+        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
             format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
         })?;
 
-        info!("binding TLS to {:?}", tls_listener);
-        let tls_listener = runtime
-            .block_on(TcpListener::bind(tls_listener))
-            .map_err(|err| {
-                format!("failed to bind to TLS socket address {tls_listener:?}: {err}")
-            })?;
+        info!("binding TLS to {addr:?}");
+
+        let tls_listener = build_tcp_listener(*addr, tls_listen_port)
+            .map_err(|err| format!("failed to bind to TLS socket address {addr:?}: {err}"))?;
 
         info!(
             "listening for TLS on {:?}",
@@ -649,9 +418,8 @@ fn config_tls(
                 .map_err(|err| format!("failed to lookup local address: {err}"))?
         );
 
-        let _guard = runtime.enter();
         server
-            .register_tls_listener(tls_listener, config.get_tcp_request_timeout(), tls_cert)
+            .register_tls_listener(tls_listener, config.tcp_request_timeout(), tls_cert)
             .map_err(|err| format!("failed to register TLS listener: {err}"))?;
     }
     Ok(())
@@ -665,39 +433,33 @@ fn config_https(
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
-    runtime: &runtime::Runtime,
 ) -> Result<(), String> {
     let https_listen_port: u16 = args
         .https_port
-        .unwrap_or_else(|| config.get_https_listen_port());
-    let https_sockaddrs: Vec<SocketAddr> = listen_addrs
-        .iter()
-        .flat_map(|x| (*x, https_listen_port).to_socket_addrs().unwrap())
-        .collect();
+        .unwrap_or_else(|| config.https_listen_port());
+    let endpoint_path = config.http_endpoint();
 
-    if https_sockaddrs.is_empty() {
+    if listen_addrs.is_empty() {
         warn!("a tls certificate was specified, but no HTTPS addresses configured to listen on");
         return Ok(());
     }
 
-    for https_listener in &https_sockaddrs {
-        let tls_cert_path = tls_cert_config.get_path();
-        if let Some(endpoint_name) = tls_cert_config.get_endpoint_name() {
+    for addr in listen_addrs {
+        let tls_cert_path = &tls_cert_config.path;
+        if let Some(endpoint_name) = &tls_cert_config.endpoint_name {
             info!("loading cert for DNS over TLS named {endpoint_name} from {tls_cert_path:?}");
         } else {
             info!("loading cert for DNS over TLS from {tls_cert_path:?}");
         }
         // TODO: see about modifying native_tls to impl Clone for Pkcs12
-        let tls_cert = dnssec::load_cert(zone_dir, tls_cert_config).map_err(|err| {
+        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
             format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
         })?;
 
-        info!("binding HTTPS to {:?}", https_listener);
-        let https_listener = runtime
-            .block_on(TcpListener::bind(https_listener))
-            .map_err(|err| {
-                format!("failed to bind to HTTPS socket address {https_listener:?}: {err}")
-            })?;
+        info!("binding HTTPS to {addr:?}");
+
+        let https_listener = build_tcp_listener(*addr, https_listen_port)
+            .map_err(|err| format!("failed to bind to HTTPS socket address {addr:?}: {err}"))?;
 
         info!(
             "listening for HTTPS on {:?}",
@@ -706,13 +468,13 @@ fn config_https(
                 .map_err(|err| format!("failed to lookup local address: {err}"))?
         );
 
-        let _guard = runtime.enter();
         server
             .register_https_listener(
                 https_listener,
-                config.get_tcp_request_timeout(),
+                config.tcp_request_timeout(),
                 tls_cert,
-                tls_cert_config.get_endpoint_name().map(|s| s.to_string()),
+                tls_cert_config.endpoint_name.clone(),
+                endpoint_path.into(),
             )
             .map_err(|err| format!("failed to register HTTPS listener: {err}"))?;
     }
@@ -728,39 +490,30 @@ fn config_quic(
     tls_cert_config: &TlsCertConfig,
     zone_dir: &Path,
     listen_addrs: &[IpAddr],
-    runtime: &runtime::Runtime,
 ) -> Result<(), String> {
-    let quic_listen_port: u16 = args
-        .quic_port
-        .unwrap_or_else(|| config.get_quic_listen_port());
-    let quic_sockaddrs: Vec<SocketAddr> = listen_addrs
-        .iter()
-        .flat_map(|x| (*x, quic_listen_port).to_socket_addrs().unwrap())
-        .collect();
+    let quic_listen_port: u16 = args.quic_port.unwrap_or_else(|| config.quic_listen_port());
 
-    if quic_sockaddrs.is_empty() {
+    if listen_addrs.is_empty() {
         warn!("a tls certificate was specified, but no QUIC addresses configured to listen on");
         return Ok(());
     }
 
-    for quic_listener in &quic_sockaddrs {
-        let tls_cert_path = tls_cert_config.get_path();
-        if let Some(endpoint_name) = tls_cert_config.get_endpoint_name() {
+    for addr in listen_addrs {
+        let tls_cert_path = &tls_cert_config.path;
+        if let Some(endpoint_name) = &tls_cert_config.endpoint_name {
             info!("loading cert for DNS over QUIC named {endpoint_name} from {tls_cert_path:?}");
         } else {
             info!("loading cert for DNS over QUIC from {tls_cert_path:?}",);
         }
         // TODO: see about modifying native_tls to impl Clone for Pkcs12
-        let tls_cert = dnssec::load_cert(zone_dir, tls_cert_config).map_err(|err| {
+        let tls_cert = tls_cert_config.load(zone_dir).map_err(|err| {
             format!("failed to load tls certificate files from {tls_cert_path:?}: {err}")
         })?;
 
-        info!("Binding QUIC to {:?}", quic_listener);
-        let quic_listener = runtime
-            .block_on(UdpSocket::bind(quic_listener))
-            .map_err(|err| {
-                format!("failed to bind to QUIC socket address {quic_listener:?}: {err}")
-            })?;
+        info!("Binding QUIC to {addr:?}");
+
+        let quic_listener = build_udp_socket(*addr, quic_listen_port)
+            .map_err(|err| format!("failed to bind to QUIC socket address {addr:?}: {err}"))?;
 
         info!(
             "listening for QUIC on {:?}",
@@ -769,13 +522,12 @@ fn config_quic(
                 .map_err(|err| format!("failed to lookup local address: {err}"))?
         );
 
-        let _guard = runtime.enter();
         server
             .register_quic_listener(
                 quic_listener,
-                config.get_tcp_request_timeout(),
+                config.tcp_request_timeout(),
                 tls_cert,
-                tls_cert_config.get_endpoint_name().map(|s| s.to_string()),
+                tls_cert_config.endpoint_name.clone(),
             )
             .map_err(|err| format!("failed to register QUIC listener: {err}"))?;
     }
@@ -857,7 +609,7 @@ fn get_env() -> String {
 
 fn all_hickory_dns(level: impl ToString) -> String {
     format!(
-        "hickory_dns={level},{env}",
+        "hickory_={level},{env}",
         level = level.to_string().to_lowercase(),
         env = get_env()
     )
@@ -895,3 +647,129 @@ fn logger(level: tracing::Level) -> Result<(), String> {
 
     Ok(())
 }
+
+/// Build a TcpListener for a given IP, port pair; IPv6 listeners will not accept v4 connections
+fn build_tcp_listener(ip: IpAddr, port: u16) -> Result<TcpListener, Error> {
+    let sock = if ip.is_ipv4() {
+        Socket::new(Domain::IPV4, Type::STREAM, None)?
+    } else {
+        let s = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+        s.set_only_v6(true)?;
+        s
+    };
+
+    sock.set_nonblocking(true)?;
+
+    let s_addr = SocketAddr::new(ip, port);
+    sock.bind(&s_addr.into())?;
+
+    // this is a fairly typical backlog value, but we don't have any good data to support it as of yet
+    sock.listen(128)?;
+
+    TcpListener::from_std(sock.into())
+}
+
+/// Build a UdpSocket for a given IP, port pair; IPv6 sockets will not accept v4 connections
+fn build_udp_socket(ip: IpAddr, port: u16) -> Result<UdpSocket, Error> {
+    let sock = if ip.is_ipv4() {
+        Socket::new(Domain::IPV4, Type::DGRAM, None)?
+    } else {
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, None)?;
+        s.set_only_v6(true)?;
+        s
+    };
+
+    sock.set_nonblocking(true)?;
+
+    let s_addr = SocketAddr::new(ip, port);
+    sock.bind(&s_addr.into())?;
+
+    UdpSocket::from_std(sock.into())
+}
+
+/// Drop privileges on Unix systems if running as root. Errors that prevent dropping privileges will
+/// halt the server.  This must be called after binding to low numbered sockets is complete.
+#[cfg(target_family = "unix")]
+fn check_drop_privs(user: &str, group: &str) -> Result<(), String> {
+    use libc::{getegid, geteuid, getgid, getgrnam, getpwnam, getuid, setgid, setuid};
+    use std::ffi::CString;
+
+    // These calls are guaranteed to succeed in a POSIX-conforming environment. In non-conforming
+    // environments, implementations may return -1 to indicate a process running without an
+    // associated UID/EUID/GID/EGID. In that case, our main block below will not execute as
+    // libc typedefs uid_t and gid_t to u32; -1 will be u32::MAX.
+    //
+    // POSIX reference: IEEE Std 1003.1-1024 getuid, geteuid, getgid, and getegid specifications
+    // https://pubs.opengroup.org/onlinepubs/9799919799/functions/getuid.html
+    // https://pubs.opengroup.org/onlinepubs/9799919799/functions/geteuid.html
+    // https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgid.html
+    // https://pubs.opengroup.org/onlinepubs/9799919799/functions/getegid.html
+    let (uid, gid, euid, egid) = unsafe { (getuid(), getgid(), geteuid(), getegid()) };
+
+    if uid == 0 || euid == 0 {
+        info!(
+            "running as root (uid: {uid} gid: {gid} euid: {euid} egid: {egid})...dropping privileges.",
+        );
+
+        let Ok(user_cstring) = CString::new(user) else {
+            return Err(format!("unable to create CString for user {user}"));
+        };
+
+        let Ok(group_cstring) = CString::new(group) else {
+            return Err(format!(
+                "unable to create CString for group {group}. Exiting."
+            ));
+        };
+
+        // These functions must be supplied a NULL-terminated string, which is guaranteed by
+        // std::ffi::CString.  Upon success, they will return a pointer to a struct passwd or
+        // struct group, or NULL upon failure. Testing for a NULL return value is mandatory.
+        //
+        // POSIX reference: IEEE Std 1003.1-1024 getpwnam and getgrnam specifications
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/getpwnam.html
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrnam.html
+        let (user_info, group_info) = unsafe {
+            (
+                getpwnam(user_cstring.as_ptr()),
+                getgrnam(group_cstring.as_ptr()),
+            )
+        };
+
+        if user_info.is_null() {
+            return Err(format!("unable to lookup user '{user}'. Exiting."));
+        }
+
+        if group_info.is_null() {
+            return Err(format!("unable to lookup group '{group}'. Exiting."));
+        }
+
+        // These functions must be supplied a gid_t (setgid) and uid_t (setuid), which are
+        // supplied by the passwd and group structs returned by getpwnam and getgrnam.
+        // The structs are tested to be valid by the calls to is_null() above.
+        //
+        // The call to setgid must be completed before the call to setuid is made or the
+        // process will almost certainly lack the privileges necessary to switch its real gid.
+        //
+        // POSIX reference: IEEE Std 1003.1-1024 setgid and setuid specifications
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/setgid.html
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/setuid.html
+        let (setgid_rc, setuid_rc) =
+            unsafe { (setgid((*group_info).gr_gid), setuid((*user_info).pw_uid)) };
+
+        if setgid_rc < 0 {
+            return Err("unable to set gid. Exiting.".into());
+        }
+
+        if setuid_rc < 0 {
+            return Err("unable to set uid. Exiting.".into());
+        }
+    }
+
+    let (uid, gid, euid, egid) = unsafe { (getuid(), getgid(), geteuid(), getegid()) };
+
+    info!("now running as uid: {uid}, gid: {gid} (euid: {euid}, egid: {egid})",);
+    Ok(())
+}
+
+static DEFAULT_USER: &str = "nobody";
+static DEFAULT_GROUP: &str = "nobody";

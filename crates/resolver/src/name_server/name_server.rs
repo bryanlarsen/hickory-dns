@@ -5,7 +5,6 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::cmp::Ordering;
 use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,16 +12,15 @@ use std::time::Instant;
 
 use futures_util::lock::Mutex;
 use futures_util::stream::{once, Stream};
-
-use proto::{
-    error::ProtoError,
-    xfer::{DnsHandle, DnsRequest, DnsResponse, FirstAnswer},
-};
 use tracing::debug;
 
 use crate::config::{NameServerConfig, ResolverOpts};
 use crate::name_server::connection_provider::{ConnectionProvider, GenericConnector};
 use crate::name_server::{NameServerState, NameServerStats};
+use crate::proto::{
+    xfer::{DnsHandle, DnsRequest, DnsResponse, FirstAnswer},
+    ProtoError,
+};
 
 /// This struct is used to create `DnsHandle` with the help of `P`.
 #[derive(Clone)]
@@ -31,7 +29,7 @@ pub struct NameServer<P: ConnectionProvider> {
     options: ResolverOpts,
     client: Arc<Mutex<Option<P::Conn>>>,
     state: Arc<NameServerState>,
-    stats: Arc<NameServerStats>,
+    pub(crate) stats: Arc<NameServerStats>,
     connection_provider: P,
 }
 
@@ -149,7 +147,7 @@ where
                 Ok(response)
             }
             Err(error) => {
-                debug!("name_server connection failure: {}", error);
+                debug!(config = ?self.config, "name_server connection failure: {}", error);
 
                 // this transitions the state to failure
                 self.state.fail(Instant::now());
@@ -187,42 +185,6 @@ where
     }
 }
 
-impl<P> Ord for NameServer<P>
-where
-    P: ConnectionProvider + Send,
-{
-    /// Custom implementation of Ord for NameServer which incorporates the performance of the connection into it's ranking
-    fn cmp(&self, other: &Self) -> Ordering {
-        // if they are literally equal, just return
-        if self == other {
-            return Ordering::Equal;
-        }
-
-        self.stats.cmp(&other.stats)
-    }
-}
-
-impl<P> PartialOrd for NameServer<P>
-where
-    P: ConnectionProvider + Send,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<P> PartialEq for NameServer<P>
-where
-    P: ConnectionProvider + Send,
-{
-    /// NameServers are equal if the config (connection information) are equal
-    fn eq(&self, other: &Self) -> bool {
-        self.config == other.config
-    }
-}
-
-impl<P> Eq for NameServer<P> where P: ConnectionProvider + Send {}
-
 #[cfg(test)]
 #[cfg(feature = "tokio-runtime")]
 mod tests {
@@ -230,24 +192,25 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::{future, FutureExt};
+    use test_support::subscribe;
     use tokio::runtime::Runtime;
 
-    use proto::op::{Query, ResponseCode};
-    use proto::rr::{Name, RecordType};
-    use proto::xfer::{DnsHandle, DnsRequestOptions, FirstAnswer};
+    use crate::proto::op::{Query, ResponseCode};
+    use crate::proto::rr::{Name, RecordType};
+    use crate::proto::xfer::{DnsHandle, DnsRequestOptions, FirstAnswer, Protocol};
 
     use super::*;
-    use crate::config::Protocol;
-    use crate::name_server::TokioConnectionProvider;
+    use crate::name_server::connection_provider::TokioConnectionProvider;
 
     #[test]
     fn test_name_server() {
-        //env_logger::try_init().ok();
+        subscribe();
 
         let config = NameServerConfig {
             socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -286,6 +249,7 @@ mod tests {
             socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 252)), 252),
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,

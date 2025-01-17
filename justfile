@@ -14,6 +14,7 @@ COV_CARGO_INCREMENTAL := "0"
 COV_CARGO_LLVM_COV := "1"
 COV_CARGO_LLVM_COV_TARGET_DIR := join(TARGET_DIR, "llvm-cov-target")
 COV_LLVM_PROFILE_FILE := join(COV_CARGO_LLVM_COV_TARGET_DIR, "hickory-dns-%p-%m_%c.profraw")
+COV_OUTPUT_DIR := join(justfile_directory(), "coverage")
 
 BIND_VER := "9.16.41"
 
@@ -23,37 +24,33 @@ default feature='' ignore='': (check feature ignore) (build feature ignore) (tes
 # Check, build, and test all crates with all-features enabled
 all-features: (default "--all-features")
 
+# Check, build, and test a sizable cross-section of crates/features that don't depend on OpenSSL
+# All features will be applied independently to all crates, so the crates/features tested here
+# need to avoid crates that don't expose the features and features that are only defined in a few crates.
+windows-features: (default "--features=dns-over-rustls,dns-over-https-rustls,dns-over-quic,dnssec-ring" "--ignore=\\{async-std-resolver,hickory-client,hickory-compatibility,test-support\\}")
+
 # Check, build, and test all crates with no-default-features
 no-default-features: (default "--no-default-features" "--ignore=\\{hickory-compatibility\\}")
 
 # Check, build, and test all crates with dns-over-rustls enabled
-dns-over-rustls: (default "--features=dns-over-rustls" "--ignore=\\{async-std-resolver,hickory-compatibility\\}")
+dns-over-rustls: (default "--features=dns-over-rustls" "--ignore=\\{async-std-resolver,hickory-compatibility,test-support\\}")
 
 # Check, build, and test all crates with dns-over-https-rustls enabled
-dns-over-https-rustls: (default "--features=dns-over-https-rustls" "--ignore=\\{async-std-resolver,hickory-compatibility\\}")
+dns-over-https-rustls: (default "--features=dns-over-https-rustls" "--ignore=\\{async-std-resolver,hickory-compatibility,test-support\\}")
 
 # Check, build, and test all crates with dns-over-quic enabled
-dns-over-quic: (default "--features=dns-over-quic" "--ignore=\\{async-std-resolver,hickory-compatibility\\}")
+dns-over-quic: (default "--features=dns-over-quic" "--ignore=\\{async-std-resolver,hickory-compatibility,test-support\\}")
 
 # Check, build, and test all crates with dns-over-h3 enabled
-dns-over-h3: (default "--features=dns-over-h3" "--ignore=\\{async-std-resolver,hickory-compatibility,hickory-client\\}")
-
-# Check, build, and test all crates with dns-over-native-tls enabled
-dns-over-native-tls: (default "--features=dns-over-native-tls" "--ignore=\\{async-std-resolver,hickory-compatibility,hickory-server,hickory-dns,hickory-util,hickory-integration\\}")
-
-# Check, build, and test all crates with dns-over-openssl enabled
-dns-over-openssl: (default "--features=dns-over-openssl" "--ignore=\\{async-std-resolver,hickory-compatibility,hickory-util\\}")
-
-# Check, build, and test all crates with dnssec-openssl enabled
-dnssec-openssl: (default "--features=dnssec-openssl" "--ignore=\\{async-std-resolver,hickory-compatibility\\}")
+dns-over-h3: (default "--features=dns-over-h3" "--ignore=\\{async-std-resolver,hickory-compatibility,hickory-client,test-support\\}")
 
 # Check, build, and test all crates with dnssec-ring enabled
-dnssec-ring: (default "--features=dnssec-ring" "--ignore=\\{async-std-resolver,hickory-compatibility\\}")
+dnssec-ring: (default "--features=dnssec-ring" "--ignore=\\{async-std-resolver,hickory-compatibility,test-support\\}")
 
 # Run check on all projects in the workspace
 check feature='' ignore='':
     cargo ws exec {{ignore}} cargo {{MSRV}} check --locked --all-targets {{feature}}
-    cargo {{MSRV}} check --manifest-path fuzz/Cargo.toml --all-targets
+    cargo {{MSRV}} check --manifest-path fuzz/Cargo.toml --locked --all-targets
 
 # Run build on all projects in the workspace
 build feature='' ignore='':
@@ -66,14 +63,18 @@ test feature='' ignore='':
 doc feature='':
     cargo ws exec --ignore=hickory-dns cargo {{MSRV}} test --locked --doc {{feature}}
 
+test-docs:
+    RUSTDOCFLAGS="-Dwarnings" cargo ws exec cargo doc --locked --all-features --no-deps --document-private-items
+
 # This tests compatibility with BIND9, TODO: support other feature sets besides openssl for tests
+[unix]
 compatibility: init-bind9
-    cargo test --manifest-path tests/compatibility-tests/Cargo.toml --locked --all-targets --no-default-features --features=none;
-    cargo test --manifest-path tests/compatibility-tests/Cargo.toml --locked --all-targets --no-default-features --features=bind;
+    RUST_LOG=debug cargo test --manifest-path tests/compatibility-tests/Cargo.toml --locked --all-targets --no-default-features --features=none;
+    RUST_LOG=debug cargo test --manifest-path tests/compatibility-tests/Cargo.toml --locked --all-targets --no-default-features --features=bind;
 
 # Build all bench marking tools, i.e. check that they work, but don't run
 build-bench:
-    RUSTFLAGS="--cfg=nightly" cargo ws exec cargo +nightly-{{NIGHTLY_DATE}} bench --locked --no-run
+    RUSTFLAGS="--cfg=nightly" cargo ws exec cargo +nightly-{{NIGHTLY_DATE}} check --locked --benches
 
 [private]
 clippy-inner feature='':
@@ -81,7 +82,6 @@ clippy-inner feature='':
 
 # Run clippy on all targets and all sources
 clippy:
-    find {{justfile_directory()}} -name '*.rs' -exec touch {} \;
     just clippy-inner --no-default-features
     just clippy-inner
     just clippy-inner --all-features
@@ -111,13 +111,12 @@ coverage: init-llvm-cov
 
     echo $RUSTFLAGS
 
-    cargo +nightly llvm-cov clean
-    mkdir -p {{COV_CARGO_LLVM_COV_TARGET_DIR}}
+    cargo +nightly llvm-cov clean --workspace
+    mkdir -p {{COV_OUTPUT_DIR}}
 
-    cargo +nightly build --workspace --all-targets --all-features
     cargo +nightly llvm-cov test --workspace --no-report --all-targets --all-features
     cargo +nightly llvm-cov test --workspace --no-report --doc --doctests --all-features
-    cargo +nightly llvm-cov report --codecov --output-path {{join(COV_CARGO_LLVM_COV_TARGET_DIR, "hickory-dns-coverage.json")}}
+    cargo +nightly llvm-cov report --doctests --codecov --output-path {{join(COV_OUTPUT_DIR, "hickory-dns-coverage.json")}}
 
 # Open the html view of the coverage report
 coverage-html: coverage
@@ -129,16 +128,31 @@ coverage-html: coverage
     export CARGO_LLVM_COV_TARGET_DIR={{COV_CARGO_LLVM_COV_TARGET_DIR}}
     export LLVM_PROFILE_FILE={{COV_LLVM_PROFILE_FILE}}
 
-    cargo +nightly llvm-cov report --html --open --output-dir {{COV_CARGO_LLVM_COV_TARGET_DIR}}
+    cargo +nightly llvm-cov report --doctests --html --open --output-dir {{COV_OUTPUT_DIR}}
+
+# Export coverage data in lcov format
+coverage-lcov: coverage
+    #!/usr/bin/env bash
+    set -euxo pipefail
+
+    export RUSTFLAGS="{{COV_RUSTFLAGS}}"
+    export CARGO_LLVM_COV={{COV_CARGO_LLVM_COV}}
+    export CARGO_LLVM_COV_TARGET_DIR={{COV_CARGO_LLVM_COV_TARGET_DIR}}
+    export LLVM_PROFILE_FILE={{COV_LLVM_PROFILE_FILE}}
+
+    cargo +nightly llvm-cov report --doctests --lcov --output-path {{join(COV_OUTPUT_DIR, "lcov.info")}}
 
 # (Re)generates Test Certificates, if tests are failing, this needs to be run yearly
+[unix]
 generate-test-certs: init-openssl
     cd {{TEST_DATA}} && rm -f ca.key ca.pem cert.key cert-key.pkcs8 cert.csr cert.pem cert.p12
     scripts/gen_certs.sh
+    cd {{TEST_DATA}}/test_configs/sec && rm -f example.key example.key.pem example.cert example.cert.pem example.p12
+    cd {{TEST_DATA}}/test_configs/sec && ./gen-keys.sh
 
 # Publish all crates
 publish:
-    cargo ws publish --from-git --token $CRATES_IO_TOKEN
+    cargo ws publish --publish-as-is --token $CRATES_IO_TOKEN
 
 # Removes the target directories cleaning all built artifacts
 clean:
@@ -164,20 +178,24 @@ conformance-bind filter='':
     DNS_TEST_VERBOSE_DOCKER_BUILD=1 DNS_TEST_PEER=unbound DNS_TEST_SUBJECT=bind cargo t --manifest-path conformance/Cargo.toml -p conformance-tests -- --include-ignored {{filter}}
 
 # runs the conformance test suite against the latest local hickory-dns commit -- changes that have not been commited will be ignored!
-conformance-hickory filter='':
-    @ bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
-    DNS_TEST_VERBOSE_DOCKER_BUILD=1 DNS_TEST_PEER=unbound DNS_TEST_SUBJECT="hickory {{justfile_directory()}}" cargo t --manifest-path conformance/Cargo.toml -p conformance-tests -- {{filter}}
-    @ bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+conformance-hickory: (conformance-hickory-ring)
+
+conformance-hickory-ring filter='':
+    @ bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
+    DNS_TEST_VERBOSE_DOCKER_BUILD=1 DNS_TEST_PEER=unbound DNS_TEST_SUBJECT="hickory {{justfile_directory()}} dnssec-ring" cargo t --manifest-path conformance/Cargo.toml -p conformance-tests -- {{filter}}
+    @ bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # checks that all conformance tests that pass with hickory-dns have been un-#[ignore]-d
 conformance-ignored:
     #!/usr/bin/env bash
 
+    set -euxo pipefail
+
     tmpfile="$(mktemp)"
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
-    DNS_TEST_VERBOSE_DOCKER_BUILD=1 DNS_TEST_PEER=unbound DNS_TEST_SUBJECT="hickory {{justfile_directory()}}" cargo test --manifest-path conformance/Cargo.toml -p conformance-tests -- --ignored | tee "$tmpfile"
-    grep 'test result: FAILED. 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
+    ( DNS_TEST_VERBOSE_DOCKER_BUILD=1 DNS_TEST_PEER=unbound DNS_TEST_SUBJECT="hickory {{justfile_directory()}} dnssec-ring" cargo test --manifest-path conformance/Cargo.toml -p conformance-tests --lib -- --ignored || true ) | tee "$tmpfile"
+    grep -e 'test result: \(ok\|FAILED\). 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # lints the conformance test suite
 conformance-clippy:
@@ -203,19 +221,21 @@ e2e-tests: (e2e-tests-run) (e2e-tests-ignored) (e2e-tests-clippy) (e2e-tests-fmt
 
 # runs hickory-specific end-to-end tests that use the dns-test framework
 e2e-tests-run:
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
     DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/e2e-tests/Cargo.toml
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # check that any fixed e2e-test has not been left marked as `#[ignore]`
 e2e-tests-ignored:
     #!/usr/bin/env bash
 
+    set -euxo pipefail
+
     tmpfile="$(mktemp)"
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
-    DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/e2e-tests/Cargo.toml -- --ignored | tee "$tmpfile"
-    grep 'test result: FAILED. 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
+    ( DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/e2e-tests/Cargo.toml --lib -- --ignored || true ) | tee "$tmpfile"
+    grep -e 'test result: \(ok\|FAILED\). 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # lints the end-to-end test suite
 e2e-tests-clippy:
@@ -230,26 +250,28 @@ ede-dot-com: (ede-dot-com-run) (ede-dot-com-ignored) (ede-dot-com-check)
 
 # runs hickory-specific ede-dot-com tests that use the dns-test framework
 ede-dot-com-run filter='':
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
-    DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/ede-dot-com/Cargo.toml -- {{filter}}
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
+    DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/ede-dot-com/Cargo.toml --locked -- {{filter}}
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # check that any fixed ede-dot-com test has not been left marked as `#[ignore]`
 ede-dot-com-ignored:
     #!/usr/bin/env bash
 
+    set -euxo pipefail
+
     tmpfile="$(mktemp)"
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes will NOT be tested" || true'
-    DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/ede-dot-com/Cargo.toml -- --ignored | tee "$tmpfile"
-    grep 'test result: FAILED. 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
-    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommited changes were NOT tested" || true'
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes will NOT be tested" || true'
+    ( DNS_TEST_VERBOSE_DOCKER_BUILD=1 cargo test --manifest-path tests/ede-dot-com/Cargo.toml --locked --lib -- --ignored || true ) | tee "$tmpfile"
+    grep -e 'test result: \(ok\|FAILED\). 0 passed' "$tmpfile" || ( echo "expected ALL tests to fail but at least one passed; the passing tests must be un-#[ignore]-d" && exit 1 )
+    bash -c '[[ -n "$(git status -s)" ]] && echo "WARNING: uncommitted changes were NOT tested" || true'
 
 # checks the ede-dot-com workspace
 ede-dot-com-check: (ede-dot-com-clippy) (ede-dot-com-fmt)
 
 # lints the ede-dot-com test suite
 ede-dot-com-clippy:
-    cargo clippy --manifest-path tests/ede-dot-com/Cargo.toml --all-targets -- -D warnings
+    cargo clippy --manifest-path tests/ede-dot-com/Cargo.toml --locked --all-targets -- -D warnings
 
 # formats the ede-dot-com test suite code
 ede-dot-com-fmt:
@@ -276,7 +298,7 @@ init-bind9-deps: init-openssl
 init-bind9-deps:
     if apt-get --version ; then sudo apt-get install -y python3-ply libuv1-dev liburcu-dev libssl-dev libcap-dev ; fi
 
-# Install BIND9, needed for compatability tests
+# Install BIND9, needed for compatibility tests
 [unix]
 init-bind9:
     #!/usr/bin/env bash
@@ -324,7 +346,7 @@ init-llvm-cov:
     @rustup component add llvm-tools-preview
 
 # Initialize all tools needed for running tests, etc.
-init: init-cargo-workspaces init-audit init-bind9
+init: init-cargo-workspaces init-audit
     @echo 'all tools initialized'
 
 # Run the server with example config, for manual testing purposes

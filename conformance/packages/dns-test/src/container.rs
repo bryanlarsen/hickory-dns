@@ -12,7 +12,7 @@ use std::{env, fs};
 use tempfile::{NamedTempFile, TempDir};
 
 pub use crate::container::network::Network;
-use crate::{Error, Implementation, Repository, Result};
+use crate::{Error, HickoryDnssecFeature, Implementation, Repository, Result};
 
 #[derive(Clone)]
 pub struct Container {
@@ -24,18 +24,32 @@ const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
 #[derive(Clone)]
 pub enum Image {
     Bind,
+    Dnslib,
     Client,
-    Hickory(Repository<'static>),
+    Hickory {
+        repo: Repository<'static>,
+        dnssec_feature: Option<HickoryDnssecFeature>,
+    },
     Unbound,
+    EdeDotCom,
 }
 
 impl Image {
+    pub fn hickory() -> Self {
+        Self::Hickory {
+            repo: Repository(crate::repo_root()),
+            dnssec_feature: None,
+        }
+    }
+
     fn dockerfile(&self) -> &'static str {
         match self {
             Self::Bind => include_str!("docker/bind.Dockerfile"),
+            Self::Dnslib => include_str!("docker/dnslib.Dockerfile"),
             Self::Client => include_str!("docker/client.Dockerfile"),
             Self::Hickory { .. } => include_str!("docker/hickory.Dockerfile"),
             Self::Unbound => include_str!("docker/unbound.Dockerfile"),
+            Self::EdeDotCom => include_str!("docker/ede-dot-com/Dockerfile"),
         }
     }
 
@@ -44,6 +58,11 @@ impl Image {
             Self::Bind => {
                 static BIND_ONCE: Once = Once::new();
                 &BIND_ONCE
+            }
+
+            Self::Dnslib => {
+                static DNSLIB_ONCE: Once = Once::new();
+                &DNSLIB_ONCE
             }
 
             Self::Client => {
@@ -60,6 +79,11 @@ impl Image {
                 static UNBOUND_ONCE: Once = Once::new();
                 &UNBOUND_ONCE
             }
+
+            Self::EdeDotCom => {
+                static EDE_ONCE: Once = Once::new();
+                &EDE_ONCE
+            }
         }
     }
 }
@@ -68,21 +92,37 @@ impl From<Implementation> for Image {
     fn from(implementation: Implementation) -> Self {
         match implementation {
             Implementation::Bind => Self::Bind,
+            Implementation::Dnslib => Self::Dnslib,
             Implementation::Unbound => Self::Unbound,
-            Implementation::Hickory(repo) => Self::Hickory(repo),
+            Implementation::Hickory {
+                repo,
+                dnssec_feature,
+            } => Self::Hickory {
+                repo,
+                dnssec_feature,
+            },
+            Implementation::EdeDotCom => Self::EdeDotCom,
         }
     }
 }
 
 impl fmt::Display for Image {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Self::Client => "client",
-            Self::Bind => "bind",
-            Self::Hickory { .. } => "hickory",
-            Self::Unbound => "unbound",
-        };
-        f.write_str(s)
+        match self {
+            Self::Client => f.write_str("client"),
+            Self::Bind => f.write_str("bind"),
+            Self::Dnslib => f.write_str("dnslib"),
+            Self::Hickory {
+                repo: _,
+                dnssec_feature: None,
+            } => f.write_str("hickory"),
+            Self::Hickory {
+                repo: _,
+                dnssec_feature: Some(dnssec_feature),
+            } => write!(f, "hickory-{dnssec_feature}"),
+            Self::Unbound => f.write_str("unbound"),
+            Self::EdeDotCom => f.write_str("ede-dot-com"),
+        }
     }
 }
 
@@ -103,7 +143,15 @@ impl Container {
             .arg(&image_tag)
             .arg(docker_build_dir);
 
-        let repo = if let Image::Hickory(repo) = image {
+        if let Image::Hickory {
+            dnssec_feature: Some(dnssec_feature),
+            ..
+        } = image
+        {
+            command.arg(format!("--build-arg=DNSSEC_FEATURE={dnssec_feature}"));
+        };
+
+        let repo = if let Image::Hickory { repo, .. } = image {
             Some(repo)
         } else {
             None
@@ -122,6 +170,19 @@ impl Container {
                     ]);
 
                     exec_or_panic(&mut cp_r, false);
+                }
+
+                if let Image::EdeDotCom = image {
+                    fs::write(
+                        docker_build_dir.join("configure_child.sh"),
+                        include_str!("docker/ede-dot-com/configure_child.sh"),
+                    )
+                    .expect("could not copy configure_child.sh");
+                    fs::write(
+                        docker_build_dir.join("configure_parent.sh"),
+                        include_str!("docker/ede-dot-com/configure_parent.sh"),
+                    )
+                    .expect("could not copy configure_parent.sh");
                 }
 
                 fs::write(docker_build_dir.join(".dockerignore"), "src/.git")
@@ -217,7 +278,9 @@ impl Container {
         let mut command = Command::new("docker");
         command
             .args(["exec", &self.inner.id])
-            .args(command_and_args);
+            .args(command_and_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         Ok(command.status()?)
     }
@@ -331,6 +394,15 @@ impl Child {
             .as_mut()
             .and_then(|child| child.stderr.take())
             .ok_or("could not retrieve child's stderr")?)
+    }
+
+    /// Returns the child's exit status, if the child process has exited. try_wait will not block
+    /// on a running process.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        match self.inner.as_mut() {
+            Some(ref mut child) => Ok(child.try_wait()?),
+            _ => Err("can't borrow child as mut for try_wait".into()),
+        }
     }
 
     pub fn wait(mut self) -> Result<Output> {

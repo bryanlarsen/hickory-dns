@@ -9,47 +9,42 @@ use std::io::Write;
 use std::net::*;
 use std::str::FromStr;
 
-use hickory_proto::iocompat::AsyncIoTokioAsStd;
-use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::{DNSClass, Name, RecordType};
-use hickory_proto::tcp::TcpClientStream;
-use hickory_proto::udp::UdpClientStream;
-
-use hickory_client::client::*;
-use hickory_server::server::Protocol;
-use tokio::net::TcpStream as TokioTcpStream;
-use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::runtime::Runtime;
 
 use crate::server_harness::{named_test_harness, query_a, query_a_refused};
+use hickory_client::client::{Client, ClientHandle};
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::runtime::TokioRuntimeProvider;
+use hickory_proto::tcp::TcpClientStream;
+use hickory_proto::udp::UdpClientStream;
+use hickory_proto::xfer::Protocol;
+use test_support::subscribe;
 
 #[test]
 fn test_example_toml_startup() {
+    subscribe();
+    let provider = TokioRuntimeProvider::new();
+
     named_test_harness("example.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
 
         // just tests that multiple queries work
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
     })
@@ -57,32 +52,27 @@ fn test_example_toml_startup() {
 
 #[test]
 fn test_ipv4_only_toml_startup() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("ipv4_only.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv4 should succeed
         query_a(&mut io_loop, &mut client);
 
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         assert!(io_loop.block_on(client).is_err());
         //let (client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        //hickory_proto::spawn_bg(&io_loop, bg);
+        //hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv6 should fail
         // FIXME: probably need to send something for proper test... maybe use JoinHandle in tokio 0.2
@@ -121,30 +111,25 @@ fn test_ipv4_only_toml_startup() {
 
 #[test]
 fn test_ipv4_and_ipv6_toml_startup() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("ipv4_and_ipv6.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
         // ipv4 should succeed
         query_a(&mut io_loop, &mut client);
 
         let tcp_port = socket_ports.get_v6(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv6 should succeed
         query_a(&mut io_loop, &mut client);
@@ -153,17 +138,15 @@ fn test_ipv4_and_ipv6_toml_startup() {
 
 #[test]
 fn test_nodata_where_name_exists() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example.toml", |socket_ports| {
         let io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         let msg = io_loop
             .block_on(client.query(
@@ -179,17 +162,15 @@ fn test_nodata_where_name_exists() {
 
 #[test]
 fn test_nxdomain_where_no_name_exists() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example.toml", |socket_ports| {
         let io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         let msg = io_loop
             .block_on(client.query(
@@ -205,22 +186,21 @@ fn test_nxdomain_where_no_name_exists() {
 
 #[test]
 fn test_server_continues_on_bad_data_udp() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let udp_port = socket_ports.get_v4(Protocol::Udp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            udp_port.expect("no udp_port"),
-        );
-        let stream = UdpClientStream::<TokioUdpSocket>::new(addr);
-        let client = AsyncClient::connect(stream);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, udp_port.expect("no udp_port")));
+
+        let stream = UdpClientStream::builder(addr, provider.clone()).build();
+        let client = Client::connect(stream);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
 
         // Send a bad packet, this should get rejected by the server
-        let raw_socket = UdpSocket::bind(SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 0))
+        let raw_socket = UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
             .expect("couldn't bind raw");
 
         raw_socket
@@ -228,15 +208,12 @@ fn test_server_continues_on_bad_data_udp() {
             .expect("raw send failed");
 
         // just tests that multiple queries work
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            udp_port.expect("no udp_port"),
-        );
-        let stream = UdpClientStream::<TokioUdpSocket>::new(addr);
-        let client = AsyncClient::connect(stream);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, udp_port.expect("no udp_port")));
+        let stream = UdpClientStream::builder(addr, provider).build();
+        let client = Client::connect(stream);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
     })
@@ -244,18 +221,16 @@ fn test_server_continues_on_bad_data_udp() {
 
 #[test]
 fn test_server_continues_on_bad_data_tcp() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
 
@@ -267,14 +242,11 @@ fn test_server_continues_on_bad_data_tcp() {
             .expect("raw send failed");
 
         // just tests that multiple queries work
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         query_a(&mut io_loop, &mut client);
     })
@@ -284,87 +256,77 @@ fn test_server_continues_on_bad_data_tcp() {
 #[cfg(feature = "resolver")]
 fn test_forward() {
     use crate::server_harness::query_message;
-    use hickory_proto::rr::rdata::A;
 
-    //env_logger::init();
+    subscribe();
+    let provider = TokioRuntimeProvider::new();
 
     named_test_harness("example_forwarder.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         let response = query_message(
             &mut io_loop,
             &mut client,
-            Name::from_str("www.example.com").unwrap(),
+            Name::from_str("www.example.com.").unwrap(),
             RecordType::A,
         )
         .unwrap();
-        assert_eq!(
-            *response.answers()[0].data().as_a().unwrap(),
-            A::new(93, 184, 215, 14)
-        );
+
+        assert!(response
+            .answers()
+            .iter()
+            .any(|record| record.data().as_a().is_some()));
 
         // just tests that multiple queries work
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         let response = query_message(
             &mut io_loop,
             &mut client,
-            Name::from_str("www.example.com").unwrap(),
+            Name::from_str("www.example.com.").unwrap(),
             RecordType::A,
         )
         .unwrap();
-        assert_eq!(
-            *response.answers()[0].data().as_a().unwrap(),
-            A::new(93, 184, 215, 14)
-        );
+        assert!(response
+            .answers()
+            .iter()
+            .any(|record| record.data().as_a().is_some()));
         assert!(!response.header().authoritative());
     })
 }
 
 #[test]
 fn test_allow_networks_toml_startup() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example_allow_networks.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
         // ipv4 should succeed
         query_a(&mut io_loop, &mut client);
 
         let tcp_port = socket_ports.get_v6(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv6 should succeed
         query_a(&mut io_loop, &mut client);
@@ -373,30 +335,25 @@ fn test_allow_networks_toml_startup() {
 
 #[test]
 fn test_deny_networks_toml_startup() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example_deny_networks.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
         // ipv4 should be refused
         query_a_refused(&mut io_loop, &mut client);
 
         let tcp_port = socket_ports.get_v6(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv6 should be refused
         query_a_refused(&mut io_loop, &mut client);
@@ -405,30 +362,25 @@ fn test_deny_networks_toml_startup() {
 
 #[test]
 fn test_deny_allow_networks_toml_startup() {
+    let provider = TokioRuntimeProvider::new();
     named_test_harness("example_deny_allow_networks.toml", |socket_ports| {
         let mut io_loop = Runtime::new().unwrap();
         let tcp_port = socket_ports.get_v4(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv4Addr::new(127, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
 
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
         // ipv4 should succeed
         query_a(&mut io_loop, &mut client);
 
         let tcp_port = socket_ports.get_v6(Protocol::Tcp);
-        let addr: SocketAddr = SocketAddr::new(
-            Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).into(),
-            tcp_port.expect("no tcp_port"),
-        );
-        let (stream, sender) = TcpClientStream::<AsyncIoTokioAsStd<TokioTcpStream>>::new(addr);
-        let client = AsyncClient::new(Box::new(stream), sender, None);
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, tcp_port.expect("no tcp_port")));
+        let (stream, sender) = TcpClientStream::new(addr, None, None, provider.clone());
+        let client = Client::new(Box::new(stream), sender, None);
         let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-        hickory_proto::spawn_bg(&io_loop, bg);
+        hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
         // ipv6 should be refused
         query_a_refused(&mut io_loop, &mut client);

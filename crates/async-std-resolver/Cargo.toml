@@ -4,7 +4,7 @@ name = "async-std-resolver"
 # A short blurb about the package. This is not rendered in any format when
 # uploaded to crates.io (aka this is not markdown)
 description = """
-Hickory DNS is a safe and secure DNS library, for async-std. This Resolver library uses the hickory-proto library to perform all DNS queries. The Resolver is intended to be a high-level library for any DNS record resolution see Resolver and AsyncResolver for supported resolution types. The Client can be used for other queries.
+Hickory DNS is a safe and secure DNS library, for async-std. This Resolver library uses the hickory-proto library to perform all DNS queries. The Resolver is intended to be a high-level library for any DNS record resolution. See Resolver for supported resolution types. The Client can be used for other queries.
 """
 
 # These URLs point to more information about the repository
@@ -34,9 +34,6 @@ system-config = ["hickory-resolver/system-config"]
 # TODO: These next features are common across the hickory crates, but they are not ready for use here
 ####
 
-#dns-over-native-tls = ["dns-over-tls", "hickory-resolver/dns-over-native-tls"]
-# DNS over TLS with OpenSSL currently needs a good way to set default CAs, use rustls or native-tls
-#dns-over-openssl = ["dns-over-tls", "hickory-resolver/dns-over-openssl"]
 #dns-over-rustls = ["dns-over-tls", "hickory-resolver/dns-over-rustls"]
 #dns-over-tls = []
 
@@ -44,7 +41,6 @@ system-config = ["hickory-resolver/system-config"]
 #dns-over-https-rustls = ["hickory-resolver/dns-over-https-rustls"]
 #dns-over-https = []
 
-#dnssec-openssl = ["dnssec", "hickory-resolver/dnssec-openssl"]
 #dnssec-ring = ["dnssec", "hickory-resolver/dnssec-ring"]
 #dnssec = []
 
@@ -64,6 +60,7 @@ socket2.workspace = true
 [dev-dependencies]
 async-std = { workspace = true, features = ["attributes"] }
 hickory-resolver = { workspace = true, default-features = false, features = ["testing"] }
+test-support.workspace = true
 
 [lints]
 workspace = true

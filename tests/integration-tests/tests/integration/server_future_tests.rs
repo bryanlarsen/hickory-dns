@@ -1,119 +1,103 @@
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(feature = "dns-over-rustls")]
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
-use futures::{future, Future, FutureExt};
+use futures::TryStreamExt;
+use hickory_client::client::{Client, ClientHandle};
+use hickory_proto::runtime::TokioRuntimeProvider;
+use hickory_proto::tcp::TcpClientStream;
+use hickory_proto::udp::UdpClientStream;
+#[cfg(feature = "dns-over-rustls")]
+use rustls::{
+    pki_types::{
+        pem::{self, PemObject},
+        CertificateDer, PrivateKeyDer,
+    },
+    ClientConfig, RootCertStore,
+};
 use tokio::net::TcpListener;
 use tokio::net::UdpSocket;
-use tokio::runtime::Runtime;
 
-use hickory_client::client::*;
-use hickory_client::tcp::TcpClientConnection;
-use hickory_client::udp::UdpClientConnection;
-use hickory_proto::error::ProtoError;
+use hickory_integration::example_authority::create_example;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
-use hickory_proto::xfer::DnsRequestSender;
-
+use hickory_proto::xfer::{DnsHandle, DnsMultiplexer};
 use hickory_server::authority::{Authority, Catalog};
 use hickory_server::ServerFuture;
+use test_support::subscribe;
 
-use hickory_integration::example_authority::create_example;
-
-#[cfg(feature = "dns-over-rustls")]
-use hickory_integration::tls_client_connection::TlsClientConnection;
-#[cfg(feature = "dns-over-rustls")]
-use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
-    RootCertStore,
-};
-
-#[test]
+#[tokio::test]
 #[allow(clippy::uninlined_format_args)]
-fn test_server_www_udp() {
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let udp_socket = runtime.block_on(UdpSocket::bind(&addr)).unwrap();
+async fn test_server_www_udp() {
+    subscribe();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let udp_socket = UdpSocket::bind(&addr).await.unwrap();
 
     let ipaddr = udp_socket.local_addr().unwrap();
     println!("udp_socket on port: {}", ipaddr);
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:udp:server".to_string())
-        .spawn(move || server_thread_udp(runtime, udp_socket, server_continue2))
-        .unwrap();
+    let server = tokio::spawn(server_thread_udp(udp_socket, server_continue2));
+    let client = tokio::spawn(client_thread_www(lazy_udp_client(ipaddr)));
 
-    let client_thread = thread::Builder::new()
-        .name("test_server:udp:client".to_string())
-        .spawn(move || client_thread_www(lazy_udp_client(ipaddr)))
-        .unwrap();
-
-    let client_result = client_thread.join();
-
+    let client_result = client.await;
     assert!(client_result.is_ok(), "client failed: {:?}", client_result);
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[allow(clippy::uninlined_format_args)]
-fn test_server_www_tcp() {
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let tcp_listener = runtime.block_on(TcpListener::bind(&addr)).unwrap();
+async fn test_server_www_tcp() {
+    subscribe();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let tcp_listener = TcpListener::bind(&addr).await.unwrap();
 
     let ipaddr = tcp_listener.local_addr().unwrap();
-    println!("tcp_listner on port: {}", ipaddr);
+    println!("tcp_listener on port: {}", ipaddr);
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:tcp:server".to_string())
-        .spawn(move || server_thread_tcp(runtime, tcp_listener, server_continue2))
-        .unwrap();
+    let server = tokio::spawn(server_thread_tcp(tcp_listener, server_continue2));
+    let client = tokio::spawn(client_thread_www(lazy_tcp_client(ipaddr)));
 
-    let client_thread = thread::Builder::new()
-        .name("test_server:tcp:client".to_string())
-        .spawn(move || client_thread_www(lazy_tcp_client(ipaddr)))
-        .unwrap();
-
-    let client_result = client_thread.join();
-
+    let client_result = client.await;
     assert!(client_result.is_ok(), "client failed: {:?}", client_result);
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn test_server_unknown_type() {
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let udp_socket = runtime.block_on(UdpSocket::bind(&addr)).unwrap();
+#[tokio::test]
+async fn test_server_unknown_type() {
+    subscribe();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let udp_socket = UdpSocket::bind(&addr).await.unwrap();
 
     let ipaddr = udp_socket.local_addr().unwrap();
     println!("udp_socket on port: {ipaddr}");
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:udp:server".to_string())
-        .spawn(move || server_thread_udp(runtime, udp_socket, server_continue2))
-        .unwrap();
+    let server = tokio::spawn(server_thread_udp(udp_socket, server_continue2));
+    let mut client = lazy_udp_client(ipaddr).await;
 
-    let conn = UdpClientConnection::new(ipaddr).unwrap();
-    let client = SyncClient::new(conn);
     let client_result = client
         .query(
-            &Name::from_str("www.example.com.").unwrap(),
+            Name::from_str("www.example.com.").unwrap(),
             DNSClass::IN,
             RecordType::Unknown(65535),
         )
+        .await
         .expect("query failed for unknown");
 
     assert_eq!(client_result.response_code(), ResponseCode::NoError);
@@ -134,27 +118,23 @@ fn test_server_unknown_type() {
     );
 
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn test_server_form_error_on_multiple_queries() {
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let udp_socket = runtime.block_on(UdpSocket::bind(&addr)).unwrap();
+#[tokio::test]
+async fn test_server_form_error_on_multiple_queries() {
+    subscribe();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let udp_socket = UdpSocket::bind(&addr).await.unwrap();
 
     let ipaddr = udp_socket.local_addr().unwrap();
     println!("udp_socket on port: {ipaddr}");
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:udp:server".to_string())
-        .spawn(move || server_thread_udp(runtime, udp_socket, server_continue2))
-        .unwrap();
-
-    let conn = UdpClientConnection::new(ipaddr).unwrap();
-    let client = SyncClient::new(conn);
+    let server = tokio::spawn(server_thread_udp(udp_socket, server_continue2));
+    let client = lazy_udp_client(ipaddr).await;
 
     // build the message
     let query_a = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
@@ -170,38 +150,35 @@ fn test_server_form_error_on_multiple_queries() {
         .set_op_code(OpCode::Query)
         .set_recursion_desired(true);
 
-    let mut client_result = client.send(message);
+    let mut client_result = client
+        .send(message)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("query failed");
 
     assert_eq!(client_result.len(), 1);
-    let client_result = client_result
-        .pop()
-        .expect("there should be one response")
-        .expect("should have been a successful network request");
+    let client_result = client_result.pop().expect("there should be one response");
 
     assert_eq!(client_result.response_code(), ResponseCode::FormErr);
 
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn test_server_no_response_on_response() {
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let udp_socket = runtime.block_on(UdpSocket::bind(&addr)).unwrap();
+#[tokio::test]
+async fn test_server_no_response_on_response() {
+    subscribe();
+
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let udp_socket = UdpSocket::bind(&addr).await.unwrap();
 
     let ipaddr = udp_socket.local_addr().unwrap();
     println!("udp_socket on port: {}", ipaddr);
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:udp:server".to_string())
-        .spawn(move || server_thread_udp(runtime, udp_socket, server_continue2))
-        .unwrap();
-
-    let conn = UdpClientConnection::new(ipaddr).unwrap();
-    let client = SyncClient::new(conn);
+    let server = tokio::spawn(server_thread_udp(udp_socket, server_continue2));
+    let client = lazy_udp_client(ipaddr).await;
 
     // build the message
     let query_a = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
@@ -211,11 +188,11 @@ fn test_server_no_response_on_response() {
         .set_op_code(OpCode::Query)
         .add_query(query_a);
 
-    let client_result = client.send(message);
+    let client_result = client.send(message).try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(client_result.len(), 0);
 
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
 #[cfg(feature = "dns-over-rustls")]
@@ -234,80 +211,81 @@ fn read_file(path: &str) -> Vec<u8> {
 
 // TODO: move all this to future based clients
 #[cfg(feature = "dns-over-rustls")]
-#[test]
+#[tokio::test]
 #[allow(clippy::uninlined_format_args)]
-fn test_server_www_tls() {
-    use hickory_proto::rustls::tls_server;
+async fn test_server_www_tls() {
     use std::env;
-    use std::path::Path;
+
+    subscribe();
 
     let dns_name = "ns.example.com";
 
     let server_path = env::var("TDNS_WORKSPACE_ROOT").unwrap_or_else(|_| "../..".to_owned());
     println!("using server src path: {}", server_path);
 
-    let ca = tls_server::read_cert(Path::new(&format!(
-        "{}/tests/test-data/ca.pem",
-        server_path
-    )))
-    .map_err(|e| format!("error reading cert: {e}"))
-    .unwrap();
-    let cert = tls_server::read_cert(Path::new(&format!(
-        "{}/tests/test-data/cert.pem",
-        server_path
-    )))
-    .map_err(|e| format!("error reading cert: {e}"))
-    .unwrap();
-    let key = tls_server::read_key(Path::new(&format!(
-        "{}/tests/test-data/cert.key",
-        server_path
-    )))
-    .unwrap();
+    let ca = read_certs(format!("{}/tests/test-data/ca.pem", server_path)).unwrap();
+    let cert_chain = read_certs(format!("{}/tests/test-data/cert.pem", server_path)).unwrap();
 
-    let cert_key = (cert, key);
+    let key =
+        PrivateKeyDer::from_pem_file(format!("{server_path}/tests/test-data/cert.key")).unwrap();
 
     // Server address
-    let runtime = Runtime::new().expect("failed to create Tokio Runtime");
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
-    let tcp_listener = runtime.block_on(TcpListener::bind(&addr)).unwrap();
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let tcp_listener = TcpListener::bind(&addr).await.unwrap();
 
     let ipaddr = tcp_listener.local_addr().unwrap();
-    println!("tcp_listner on port: {ipaddr}");
+    println!("tcp_listener on port: {ipaddr}");
     let server_continue = Arc::new(AtomicBool::new(true));
     let server_continue2 = server_continue.clone();
 
-    let server_thread = thread::Builder::new()
-        .name("test_server:tls:server".to_string())
-        .spawn(move || server_thread_tls(tcp_listener, server_continue2, cert_key, runtime))
-        .unwrap();
+    let server = tokio::spawn(server_thread_tls(
+        tcp_listener,
+        server_continue2,
+        (cert_chain, key),
+    ));
 
-    let client_thread = thread::Builder::new()
-        .name("test_server:tcp:client".to_string())
-        .spawn(move || client_thread_www(lazy_tls_client(ipaddr, dns_name.to_string(), ca)))
-        .unwrap();
+    let client = tokio::spawn(client_thread_www(lazy_tls_client(
+        ipaddr,
+        dns_name.to_string(),
+        ca,
+    )));
 
-    let client_result = client_thread.join();
+    let client_result = client.await;
 
     assert!(client_result.is_ok(), "client failed: {:?}", client_result);
     server_continue.store(false, Ordering::Relaxed);
-    server_thread.join().unwrap();
+    server.await.unwrap();
 }
 
-fn lazy_udp_client(ipaddr: SocketAddr) -> UdpClientConnection {
-    UdpClientConnection::new(ipaddr).unwrap()
+async fn lazy_udp_client(addr: SocketAddr) -> Client {
+    let conn = UdpClientStream::builder(addr, TokioRuntimeProvider::default()).build();
+    let (client, driver) = Client::connect(conn).await.expect("failed to connect");
+    tokio::spawn(driver);
+    client
 }
 
-fn lazy_tcp_client(ipaddr: SocketAddr) -> TcpClientConnection {
-    TcpClientConnection::new(ipaddr).unwrap()
+async fn lazy_tcp_client(addr: SocketAddr) -> Client {
+    let (stream, sender) = TcpClientStream::new(addr, None, None, TokioRuntimeProvider::default());
+    let multiplexer = DnsMultiplexer::new(stream, sender, None);
+    let (client, driver) = Client::connect(multiplexer)
+        .await
+        .expect("failed to connect");
+    tokio::spawn(driver);
+    client
 }
 
 #[cfg(feature = "dns-over-rustls")]
-fn lazy_tls_client(
+fn read_certs(cert_path: impl AsRef<Path>) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
+    CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()
+}
+
+#[cfg(feature = "dns-over-rustls")]
+async fn lazy_tls_client(
     ipaddr: SocketAddr,
     dns_name: String,
     cert_chain: Vec<CertificateDer<'static>>,
-) -> TlsClientConnection<hickory_proto::iocompat::AsyncIoTokioAsStd<tokio::net::TcpStream>> {
-    use rustls::ClientConfig;
+) -> Client {
+    use hickory_proto::rustls::tls_client_connect_with_bind_addr;
 
     let mut root_store = RootCertStore::empty();
     let (_, ignored) = root_store.add_parsable_certificates(cert_chain);
@@ -320,19 +298,29 @@ fn lazy_tls_client(
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-    TlsClientConnection::new(ipaddr, None, dns_name, Arc::new(config))
+    let (tls_client_stream, handle) = tls_client_connect_with_bind_addr(
+        ipaddr,
+        None,
+        dns_name,
+        Arc::new(config),
+        TokioRuntimeProvider::default(),
+    );
+
+    let multiplexer = DnsMultiplexer::new(Box::pin(tls_client_stream), handle, None);
+    let (client, driver) = Client::connect(multiplexer)
+        .await
+        .expect("failed to connect");
+    tokio::spawn(driver);
+    client
 }
 
-fn client_thread_www<C: ClientConnection>(conn: C)
-where
-    C::Sender: DnsRequestSender,
-    C::SenderFuture: Future<Output = Result<C::Sender, ProtoError>> + 'static + Send,
-{
-    let name = Name::from_str("www.example.com").unwrap();
-    let client = SyncClient::new(conn);
+async fn client_thread_www(future: impl Future<Output = Client>) {
+    let name = Name::from_str("www.example.com.").unwrap();
 
+    let mut client = future.await;
     let response = client
-        .query(&name, DNSClass::IN, RecordType::A)
+        .query(name.clone(), DNSClass::IN, RecordType::A)
+        .await
         .expect("error querying");
 
     assert_eq!(
@@ -348,8 +336,8 @@ where
     assert_eq!(record.record_type(), RecordType::A);
     assert_eq!(record.dns_class(), DNSClass::IN);
 
-    if let RData::A(ref address) = *record.data() {
-        assert_eq!(address, &A::new(93, 184, 215, 14))
+    if let RData::A(address) = *record.data() {
+        assert_eq!(address, A::new(93, 184, 215, 14))
     } else {
         panic!();
     }
@@ -359,55 +347,43 @@ fn new_catalog() -> Catalog {
     let example = create_example();
     let origin = example.origin().clone();
 
-    let mut catalog: Catalog = Catalog::new();
-    catalog.upsert(origin, Box::new(Arc::new(example)));
+    let mut catalog = Catalog::new();
+    catalog.upsert(origin, vec![Arc::new(example)]);
     catalog
 }
 
-fn server_thread_udp(io_loop: Runtime, udp_socket: UdpSocket, server_continue: Arc<AtomicBool>) {
+async fn server_thread_udp(udp_socket: UdpSocket, server_continue: Arc<AtomicBool>) {
     let catalog = new_catalog();
-
     let mut server = ServerFuture::new(catalog);
-
-    let _guard = io_loop.enter();
     server.register_socket(udp_socket);
 
     while server_continue.load(Ordering::Relaxed) {
-        io_loop.block_on(future::lazy(|_| tokio::time::sleep(Duration::from_millis(10))).flatten());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    _ = io_loop.block_on(server.shutdown_gracefully());
-    drop(io_loop);
+    server.shutdown_gracefully().await.unwrap();
 }
 
-fn server_thread_tcp(
-    io_loop: Runtime,
-    tcp_listener: TcpListener,
-    server_continue: Arc<AtomicBool>,
-) {
+async fn server_thread_tcp(tcp_listener: TcpListener, server_continue: Arc<AtomicBool>) {
     let catalog = new_catalog();
     let mut server = ServerFuture::new(catalog);
-
-    let _guard = io_loop.enter();
     server.register_listener(tcp_listener, Duration::from_secs(30));
 
     while server_continue.load(Ordering::Relaxed) {
-        io_loop.block_on(future::lazy(|_| tokio::time::sleep(Duration::from_millis(10))).flatten());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    _ = io_loop.block_on(server.shutdown_gracefully());
+    server.shutdown_gracefully().await.unwrap();
 }
 
 // TODO: need a rustls option
 #[cfg(feature = "dns-over-rustls")]
 #[allow(unused)]
-fn server_thread_tls(
+async fn server_thread_tls(
     tls_listener: TcpListener,
     server_continue: Arc<AtomicBool>,
     cert_chain: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
-    io_loop: Runtime,
 ) {
-    use hickory_server::config::dnssec::{self, CertType, PrivateKeyType, TlsCertConfig};
     use std::path::Path;
 
     let catalog = new_catalog();
@@ -418,15 +394,14 @@ fn server_thread_tls(
     //     .parse("mypass")
     //     .expect("Pkcs12::from_der");
     // let pkcs12 = ((pkcs12.cert, pkcs12.chain), pkcs12.pkey);
-    io_loop.block_on(future::lazy(|_| {
-        server
-            .register_tls_listener(tls_listener, Duration::from_secs(30), cert_chain)
-            .expect("failed to register TLS")
-    }));
+
+    server
+        .register_tls_listener(tls_listener, Duration::from_secs(30), cert_chain)
+        .expect("failed to register TLS");
 
     while server_continue.load(Ordering::Relaxed) {
-        io_loop.block_on(future::lazy(|_| tokio::time::sleep(Duration::from_millis(10))).flatten());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    _ = io_loop.block_on(server.shutdown_gracefully());
+    server.shutdown_gracefully().await;
 }

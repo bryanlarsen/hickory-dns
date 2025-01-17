@@ -13,13 +13,14 @@ use std::str::FromStr;
 use ipconfig::computer::{get_domain, get_search_list, is_round_robin_enabled};
 use ipconfig::get_adapters;
 
-use proto::rr::Name;
+use crate::proto::rr::Name;
 
-use crate::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
-use crate::error::ResolveResult;
+use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use crate::error::ResolveError;
+use crate::proto::xfer::Protocol;
 
 /// Returns the name servers of the computer (of all adapters)
-fn get_name_servers() -> ResolveResult<Vec<NameServerConfig>> {
+fn get_name_servers() -> Result<Vec<NameServerConfig>, ResolveError> {
     let adapters = get_adapters()?;
     let mut name_servers = vec![];
 
@@ -32,6 +33,7 @@ fn get_name_servers() -> ResolveResult<Vec<NameServerConfig>> {
             socket_addr,
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -41,6 +43,7 @@ fn get_name_servers() -> ResolveResult<Vec<NameServerConfig>> {
             socket_addr,
             protocol: Protocol::Tcp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -50,7 +53,7 @@ fn get_name_servers() -> ResolveResult<Vec<NameServerConfig>> {
     Ok(name_servers)
 }
 
-pub fn read_system_conf() -> ResolveResult<(ResolverConfig, ResolverOpts)> {
+pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), ResolveError> {
     let name_servers = get_name_servers()?;
 
     let search_list: Vec<Name> = get_search_list()?

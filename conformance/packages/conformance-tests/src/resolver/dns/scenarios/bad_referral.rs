@@ -9,99 +9,66 @@ use dns_test::record::{Record, RecordType};
 use dns_test::{Network, Resolver, Result, FQDN};
 
 #[test]
-#[ignore = "hickory-dns times out `dig`"]
 fn v4_this_host() -> Result<()> {
     if dns_test::SUBJECT.is_unbound() {
         // unbound does not answer and `dig` times out
         return Ok(());
     }
 
-    let output = fixture("v4-this-host", Ipv4Addr::new(0, 0, 0, 0))?;
+    let (output, logs) = fixture("v4-this-host", Ipv4Addr::UNSPECIFIED)?;
     dbg!(&output);
 
     assert!(output.status.is_servfail());
 
-    Ok(())
-}
-
-// as per RFC5737, `198.51.100.0/24` is an IANA reserved subnet that SHOULD not be used
-#[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_doc() -> Result<()> {
-    let output = fixture("v4-doc", Ipv4Addr::new(198, 51, 100, 0))?;
-    dbg!(&output);
-
-    assert!(output.status.is_servfail());
+    if dns_test::SUBJECT.is_hickory()
+        && !logs.lines().any(|line| {
+            line.contains("ignoring address due to do_not_query") && line.contains("0.0.0.0")
+        })
+    {
+        panic!("did not find ignored referral to 0.0.0.0");
+    }
 
     Ok(())
 }
 
 #[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_reserved() -> Result<()> {
-    let output = fixture("v4-reserved", Ipv4Addr::new(240, 0, 0, 0))?;
-    dbg!(&output);
-
-    assert!(output.status.is_servfail());
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_link_local() -> Result<()> {
-    let output = fixture("v4-link-local", Ipv4Addr::new(169, 254, 0, 1))?;
-
-    assert!(output.status.is_servfail());
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "hickory-dns answers with NOERROR"]
 fn v4_loopback() -> Result<()> {
-    let output = fixture("v4-loopback", Ipv4Addr::new(127, 0, 0, 1))?;
+    let (output, logs) = fixture("v4-loopback", Ipv4Addr::LOCALHOST)?;
     dbg!(&output);
 
     assert!(output.status.is_servfail());
+
+    if dns_test::SUBJECT.is_hickory()
+        && !logs.lines().any(|line| {
+            line.contains("ignoring address due to do_not_query") && line.contains("127.0.0.1")
+        })
+    {
+        panic!("did not find ignored referral to 127.0.0.1");
+    }
 
     Ok(())
 }
 
 #[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_private_10() -> Result<()> {
-    let output = fixture("v4-private-10", Ipv4Addr::new(10, 0, 0, 1))?;
+fn v4_broadcast() -> Result<()> {
+    let (output, logs) = fixture("v4-broadcast", Ipv4Addr::BROADCAST)?;
     dbg!(&output);
 
     assert!(output.status.is_servfail());
 
-    Ok(())
-}
-
-#[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_private_172() -> Result<()> {
-    let output = fixture("v4-private-172", Ipv4Addr::new(172, 16, 0, 1))?;
-    dbg!(&output);
-
-    assert!(output.status.is_servfail());
+    if dns_test::SUBJECT.is_hickory()
+        && !logs.lines().any(|line| {
+            line.contains("ignoring address due to do_not_query")
+                && line.contains("255.255.255.255")
+        })
+    {
+        panic!("did not find ignored referral to 255.255.255.255");
+    }
 
     Ok(())
 }
 
-#[test]
-#[ignore = "hickory-dns answers with NOERROR"]
-fn v4_private_192() -> Result<()> {
-    let output = fixture("v4-private-192", Ipv4Addr::new(192, 168, 0, 1))?;
-    dbg!(&output);
-
-    assert!(output.status.is_servfail());
-
-    Ok(())
-}
-
-fn fixture(label: &str, addr: Ipv4Addr) -> Result<DigOutput> {
+fn fixture(label: &str, addr: Ipv4Addr) -> Result<(DigOutput, String)> {
     let network = Network::new()?;
 
     let leaf_zone = FQDN::TEST_TLD.push_label(label);
@@ -138,6 +105,8 @@ fn fixture(label: &str, addr: Ipv4Addr) -> Result<DigOutput> {
     let resolver = resolver.start()?;
 
     let client = Client::new(&network)?;
-    let settings = *DigSettings::default().recurse();
-    client.dig(settings, resolver.ipv4_addr(), RecordType::A, &needle_fqdn)
+    let settings = *DigSettings::default().recurse().timeout(7);
+    let output = client.dig(settings, resolver.ipv4_addr(), RecordType::A, &needle_fqdn)?;
+
+    Ok((output, resolver.logs().unwrap()))
 }

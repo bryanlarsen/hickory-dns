@@ -14,18 +14,15 @@ use std::io::*;
 use std::net::*;
 use std::sync::Arc;
 
-use hickory_server::server::Protocol;
 use rustls::pki_types::CertificateDer;
-use rustls::ClientConfig;
-use rustls::RootCertStore;
-use tokio::net::TcpStream as TokioTcpStream;
+use rustls::{ClientConfig, RootCertStore};
 use tokio::runtime::Runtime;
 
-use hickory_client::client::*;
-use hickory_proto::iocompat::AsyncIoTokioAsStd;
-use hickory_proto::rustls::tls_client_connect;
-
 use crate::server_harness::{named_test_harness, query_a};
+use hickory_client::client::Client;
+use hickory_proto::runtime::TokioRuntimeProvider;
+use hickory_proto::rustls::tls_client_connect;
+use hickory_proto::xfer::Protocol;
 
 #[test]
 fn test_example_tls_toml_startup() {
@@ -45,12 +42,7 @@ fn test_example_tls_toml_startup() {
             .expect("failed to read cert");
 
             let mut io_loop = Runtime::new().unwrap();
-            let addr: SocketAddr = ("127.0.0.1", tls_port.expect("no tls_port"))
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap();
-
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tls_port.expect("no tls_port")));
             let mut root_store = RootCertStore::empty();
             root_store
                 .add(CertificateDer::from(cert_der))
@@ -66,33 +58,28 @@ fn test_example_tls_toml_startup() {
 
             let config = Arc::new(config);
 
-            let (stream, sender) = tls_client_connect::<AsyncIoTokioAsStd<TokioTcpStream>>(
+            let provider = TokioRuntimeProvider::new();
+            let (stream, sender) = tls_client_connect(
                 addr,
                 "ns.example.com".to_string(),
                 config.clone(),
+                provider.clone(),
             );
-            let client = AsyncClient::new(stream, sender, None);
+            let client = Client::new(stream, sender, None);
 
             let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-            hickory_proto::spawn_bg(&io_loop, bg);
+            hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
             // ipv4 should succeed
             query_a(&mut io_loop, &mut client);
 
-            let addr: SocketAddr = ("127.0.0.1", tls_port.expect("no tls_port"))
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap();
-            let (stream, sender) = tls_client_connect::<AsyncIoTokioAsStd<TokioTcpStream>>(
-                addr,
-                "ns.example.com".to_string(),
-                config,
-            );
-            let client = AsyncClient::new(stream, sender, None);
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tls_port.expect("no tls_port")));
+            let (stream, sender) =
+                tls_client_connect(addr, "ns.example.com".to_string(), config, provider);
+            let client = Client::new(stream, sender, None);
 
             let (mut client, bg) = io_loop.block_on(client).expect("client failed to connect");
-            hickory_proto::spawn_bg(&io_loop, bg);
+            hickory_proto::runtime::spawn_bg(&io_loop, bg);
 
             // ipv6 should succeed
             query_a(&mut io_loop, &mut client);

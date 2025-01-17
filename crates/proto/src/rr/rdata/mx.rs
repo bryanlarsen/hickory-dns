@@ -128,7 +128,7 @@ impl RecordData for MX {
 }
 
 /// [RFC 1033](https://tools.ietf.org/html/rfc1033), DOMAIN OPERATIONS GUIDE, November 1987
-
+///
 /// ```text
 ///   MX (Mail Exchanger)  (See RFC-974 for more details.)
 ///
@@ -164,7 +164,12 @@ impl RecordData for MX {
 ///   anything in FOO.COM, but that it won't match a plain FOO.COM.
 impl fmt::Display for MX {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{pref} {ex}", pref = self.preference, ex = self.exchange)
+        write!(
+            f,
+            "{pref} {ex}",
+            pref = &self.preference,
+            ex = self.exchange
+        )
     }
 }
 
@@ -178,7 +183,7 @@ mod tests {
     fn test() {
         use std::str::FromStr;
 
-        let rdata = MX::new(16, Name::from_str("mail.example.com").unwrap());
+        let rdata = MX::new(16, Name::from_str("mail.example.com.").unwrap());
 
         let mut bytes = Vec::new();
         let mut encoder: BinEncoder<'_> = BinEncoder::new(&mut bytes);

@@ -5,10 +5,11 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 use std::sync::Arc;
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fs::File,
     io::Read,
     net::SocketAddr,
@@ -19,13 +20,17 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
+#[cfg(feature = "dnssec-ring")]
 use crate::proto::{
-    rr::{RData, Record, RecordSet},
+    dnssec::{TrustAnchor, Verifier},
+    serialize::txt::trust_anchor::{self, Entry},
+};
+use crate::proto::{
+    rr::{Name, RData, Record, RecordSet},
     serialize::txt::Parser,
 };
-use crate::resolver::Name;
-#[cfg(feature = "dnssec")]
-use crate::{proto::rr::dnssec::TrustAnchor, recursor::DnssecPolicy};
+use crate::recursor::DnssecPolicy;
+use crate::resolver::dns_lru::TtlConfig;
 
 /// Configuration for file based zones
 #[derive(Clone, Deserialize, Eq, PartialEq, Debug)]
@@ -40,14 +45,33 @@ pub struct RecursiveConfig {
     /// Maximum DNS record cache size
     pub record_cache_size: Option<usize>,
 
+    /// Maximum recursion depth for queries. Set to 0 for unlimited recursion depth.
+    #[serde(default = "recursion_limit_default")]
+    pub recursion_limit: u8,
+
+    /// Maximum recursion depth for building NS pools. Set to 0 for unlimited recursion depth.
+    #[serde(default = "ns_recursion_limit_default")]
+    pub ns_recursion_limit: u8,
+
     /// DNSSEC policy
-    #[cfg(feature = "dnssec")]
     #[serde(default)]
     pub dnssec_policy: DnssecPolicyConfig,
 
+    /// Networks that will be queried during resolution
+    #[serde(default)]
+    pub allow_server: Vec<IpNet>,
+
     /// Networks that will not be queried during resolution
     #[serde(default)]
-    pub do_not_query: Vec<IpNet>,
+    pub deny_server: Vec<IpNet>,
+
+    /// Local UDP ports to avoid when making outgoing queries
+    #[serde(default)]
+    pub avoid_local_udp_ports: HashSet<u16>,
+
+    /// Caching policy, setting minimum and maximum TTLs
+    #[serde(default)]
+    pub cache_policy: TtlConfig,
 }
 
 impl RecursiveConfig {
@@ -79,19 +103,28 @@ impl RecursiveConfig {
     }
 }
 
+fn recursion_limit_default() -> u8 {
+    12
+}
+
+fn ns_recursion_limit_default() -> u8 {
+    16
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[allow(missing_copy_implementations)]
 pub enum DnssecPolicyConfig {
     /// security unaware; DNSSEC records will not be requested nor processed
     #[default]
     SecurityUnaware,
 
     /// DNSSEC validation is disabled; DNSSEC records will be requested and processed
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     ValidationDisabled,
 
     /// DNSSEC validation is enabled and will use the chosen `trust_anchor` set of keys
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     ValidateWithStaticKey {
         /// set to `None` to use built-in trust anchor
         path: Option<PathBuf>,
@@ -102,9 +135,9 @@ impl DnssecPolicyConfig {
     pub(crate) fn load(&self) -> Result<DnssecPolicy, String> {
         Ok(match self {
             Self::SecurityUnaware => DnssecPolicy::SecurityUnaware,
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             Self::ValidationDisabled => DnssecPolicy::ValidationDisabled,
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             Self::ValidateWithStaticKey { path } => DnssecPolicy::ValidateWithStaticKey {
                 trust_anchor: path
                     .as_ref()
@@ -116,7 +149,7 @@ impl DnssecPolicyConfig {
     }
 }
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 fn read_trust_anchor(path: &Path) -> Result<TrustAnchor, String> {
     use std::fs;
 
@@ -125,13 +158,8 @@ fn read_trust_anchor(path: &Path) -> Result<TrustAnchor, String> {
     parse_trust_anchor(&contents)
 }
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 fn parse_trust_anchor(input: &str) -> Result<TrustAnchor, String> {
-    use crate::proto::{
-        rr::dnssec::PublicKeyEnum,
-        serialize::txt::trust_anchor::{self, Entry},
-    };
-
     let parser = trust_anchor::Parser::new(input);
     let entries = parser.parse().map_err(|e| e.to_string())?;
 
@@ -140,9 +168,8 @@ fn parse_trust_anchor(input: &str) -> Result<TrustAnchor, String> {
         if let Entry::DNSKEY(record) = entry {
             let dnskey = record.data();
             // XXX should we filter based on `dnskey.flags()`?
-            let key = PublicKeyEnum::from_public_bytes(dnskey.public_key(), dnskey.algorithm())
-                .map_err(|e| e.to_string())?;
-            trust_anchor.insert_trust_anchor(&key);
+            let key = dnskey.key().map_err(|e| e.to_string())?;
+            trust_anchor.insert_trust_anchor(&*key);
         }
     }
 
@@ -153,7 +180,7 @@ fn parse_trust_anchor(input: &str) -> Result<TrustAnchor, String> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     #[test]
     fn can_load_trust_anchor_file() {
         let input = include_str!("../../../../proto/tests/test-data/root.key");
@@ -162,7 +189,7 @@ mod tests {
         assert_eq!(3, trust_anchor.len());
     }
 
-    #[cfg(all(feature = "dnssec", feature = "toml"))]
+    #[cfg(all(feature = "dnssec-ring", feature = "toml"))]
     #[test]
     fn can_parse_recursive_config() {
         let input = r#"roots = "/etc/root.hints"
@@ -175,5 +202,39 @@ dnssec_policy.ValidateWithStaticKey.path = "/etc/trusted-key.key""#;
         } else {
             unreachable!()
         }
+    }
+
+    #[cfg(all(feature = "recursor", feature = "toml"))]
+    #[test]
+    fn can_parse_recursor_cache_policy() {
+        use std::time::Duration;
+
+        use hickory_proto::rr::RecordType;
+
+        let input = r#"roots = "/etc/root.hints"
+
+[cache_policy.default]
+positive_max_ttl = 14400
+
+[cache_policy.A]
+positive_max_ttl = 3600"#;
+
+        let config: RecursiveConfig = toml::from_str(input).unwrap();
+
+        assert_eq!(
+            *config
+                .cache_policy
+                .positive_response_ttl_bounds(RecordType::MX)
+                .end(),
+            Duration::from_secs(14400)
+        );
+
+        assert_eq!(
+            *config
+                .cache_policy
+                .positive_response_ttl_bounds(RecordType::A)
+                .end(),
+            Duration::from_secs(3600)
+        )
     }
 }

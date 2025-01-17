@@ -11,14 +11,13 @@ use std::{fmt, io, sync};
 
 use thiserror::Error;
 
-use crate::proto::rr::{rdata::SOA, Record};
-use crate::proto::{error::ProtoError, xfer::retry_dns_handle::RetryableError};
-
+use crate::proto::{
+    rr::{rdata::SOA, Record},
+    xfer::retry_dns_handle::RetryableError,
+    ProtoError, ProtoErrorKind,
+};
 #[cfg(feature = "backtrace")]
 use crate::proto::{trace, ExtBacktrace};
-
-/// An alias for results returned by functions of this crate
-pub type ResolveResult<T> = ::std::result::Result<T, ResolveError>;
 
 #[allow(clippy::large_enum_variant)]
 /// The error kind for errors that get returned in the crate
@@ -43,7 +42,7 @@ impl Clone for ResolveErrorKind {
         use self::ResolveErrorKind::*;
         match self {
             Message(msg) => Message(msg),
-            Msg(ref msg) => Msg(msg.clone()),
+            Msg(msg) => Msg(msg.clone()),
             // foreign
             Proto(proto) => Self::from(proto.clone()),
         }
@@ -64,10 +63,15 @@ impl ResolveError {
         &self.kind
     }
 
+    /// Take the kind of the error
+    pub fn into_kind(self) -> ResolveErrorKind {
+        self.kind
+    }
+
     /// If this is an underlying proto error, return that
     pub fn proto(&self) -> Option<&ProtoError> {
-        match self.kind {
-            ResolveErrorKind::Proto(ref proto) => Some(proto),
+        match &self.kind {
+            ResolveErrorKind::Proto(proto) => Some(proto),
             _ => None,
         }
     }
@@ -115,7 +119,7 @@ impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cfg_if::cfg_if! {
             if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
+                if let Some(backtrace) = &self.backtrack {
                     fmt::Display::fmt(&self.kind, f)?;
                     fmt::Debug::fmt(backtrace, f)
                 } else {
@@ -144,9 +148,18 @@ impl From<&'static str> for ResolveError {
     }
 }
 
+impl TryFrom<ResolveError> for ProtoErrorKind {
+    type Error = ResolveError;
+    fn try_from(error: ResolveError) -> Result<Self, Self::Error> {
+        match error.kind {
+            ResolveErrorKind::Proto(p) => Ok(*p.kind),
+            _ => Err(error),
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[cfg(feature = "system-config")]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "system-config", windows))))]
 impl From<ipconfig::error::Error> for ResolveError {
     fn from(e: ipconfig::error::Error) -> ResolveError {
         ResolveErrorKind::Msg(format!("failed to read from registry: {}", e)).into()

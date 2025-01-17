@@ -61,7 +61,7 @@ where
         match stream.poll_next_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                if let Some(ref result) = result {
+                if let Some(result) = &result {
                     stored_result.push(result.clone());
                 }
                 Poll::Ready(result)
@@ -89,8 +89,8 @@ mod tests {
     use futures::future;
     use futures_util::stream::once;
 
-    use crate::proto::error::{ProtoError, ProtoErrorKind};
     use crate::proto::xfer::FirstAnswer;
+    use crate::proto::{ProtoError, ProtoErrorKind};
 
     use super::*;
 

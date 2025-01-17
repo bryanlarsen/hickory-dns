@@ -9,12 +9,12 @@ use name_server::{NameServer, Running};
 
 pub use crate::container::Network;
 pub use crate::fqdn::FQDN;
-pub use crate::implementation::{Implementation, Repository};
+pub use crate::implementation::{HickoryDnssecFeature, Implementation, Repository};
 pub use crate::resolver::Resolver;
 pub use crate::trust_anchor::TrustAnchor;
 
 pub mod client;
-mod container;
+pub mod container;
 mod fqdn;
 mod implementation;
 pub mod name_server;
@@ -92,7 +92,15 @@ pub fn inspect(clients: &[Client], resolvers: &[Resolver], nameservers: &[NameSe
 }
 
 fn parse_subject() -> Implementation {
-    if let Ok(subject) = env::var("DNS_TEST_SUBJECT") {
+    parse_implementation("DNS_TEST_SUBJECT")
+}
+
+fn parse_peer() -> Implementation {
+    parse_implementation("DNS_TEST_PEER")
+}
+
+fn parse_implementation(env_var: &str) -> Implementation {
+    if let Ok(subject) = env::var(env_var) {
         if subject == "unbound" {
             return Implementation::Unbound;
         }
@@ -102,25 +110,20 @@ fn parse_subject() -> Implementation {
         }
 
         if subject.starts_with("hickory") {
-            if let Some(url) = subject.strip_prefix("hickory ") {
-                Implementation::Hickory(Repository(url.to_string()))
+            let Some(rest) = subject.strip_prefix("hickory ") else {
+                panic!("the syntax of {env_var} is 'hickory $URL' or 'hickory $URL $DNSSEC_FEATURE', e.g. 'hickory /tmp/hickory' or 'hickory https://github.com/owner/repo'")
+            };
+            let (url, dnssec_feature) = if let Some((url, dnssec_feature)) = rest.split_once(' ') {
+                (url, Some(dnssec_feature.parse().unwrap()))
             } else {
-                panic!("the syntax of DNS_TEST_SUBJECT is 'hickory $URL', e.g. 'hickory /tmp/hickory' or 'hickory https://github.com/owner/repo'")
+                (rest, None)
+            };
+            Implementation::Hickory {
+                repo: Repository(url.to_string()),
+                dnssec_feature,
             }
         } else {
             panic!("unknown implementation: {subject}")
-        }
-    } else {
-        Implementation::default()
-    }
-}
-
-fn parse_peer() -> Implementation {
-    if let Ok(peer) = env::var("DNS_TEST_PEER") {
-        match peer.as_str() {
-            "unbound" => Implementation::Unbound,
-            "bind" => Implementation::Bind,
-            _ => panic!("`{peer}` is not supported as a test peer implementation"),
         }
     } else {
         Implementation::default()
@@ -146,7 +149,7 @@ mod tests {
     impl PartialEq for Implementation {
         fn eq(&self, other: &Self) -> bool {
             match (self, other) {
-                (Self::Hickory(_), Self::Hickory(_)) => true,
+                (Self::Hickory { .. }, Self::Hickory { .. }) => true,
                 _ => core::mem::discriminant(self) == core::mem::discriminant(other),
             }
         }

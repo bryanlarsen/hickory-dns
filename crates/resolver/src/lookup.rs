@@ -12,37 +12,28 @@ use std::{
     pin::Pin,
     slice::Iter,
     sync::Arc,
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use futures_util::{
-    future::{self, Future},
-    stream::Stream,
-    FutureExt,
-};
+use futures_util::stream::Stream;
 
 use crate::{
-    caching_client::CachingClient,
     dns_lru::MAX_TTL,
-    error::*,
-    hosts::Hosts,
     lookup_ip::LookupIpIter,
     name_server::{ConnectionProvider, NameServerPool},
     proto::{
-        error::ProtoError,
         op::Query,
         rr::{
             rdata::{self, A, AAAA, NS, PTR},
-            Name, RData, Record, RecordType,
+            RData, Record,
         },
-        xfer::{DnsRequest, DnsRequestOptions, DnsResponse},
-        DnsHandle, RetryDnsHandle,
+        xfer::{DnsRequest, DnsResponse},
+        DnsHandle, ProtoError, RetryDnsHandle,
     },
 };
 
-#[cfg(feature = "dnssec")]
-use proto::{rr::dnssec::Proven, DnssecDnsHandle};
+#[cfg(feature = "dnssec-ring")]
+use crate::proto::dnssec::{DnssecDnsHandle, Proven};
 
 /// Result of a DNS query when querying for any record type supported by the Hickory DNS Proto library.
 ///
@@ -85,13 +76,15 @@ impl Lookup {
         &self.query
     }
 
-    /// Returns an iterator over the matching the queried record type.
+    /// Returns an iterator over the data of all records returned during the query.
+    ///
+    /// It may include additional record types beyond the queried type, e.g. CNAME.
     pub fn iter(&self) -> LookupIter<'_> {
         LookupIter(self.records.iter())
     }
 
     /// Returns a borrowed iterator of the returned data wrapped in a dnssec Proven type
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     pub fn dnssec_iter(&self) -> DnssecIter<'_> {
         DnssecIter(self.dnssec_record_iter())
     }
@@ -104,7 +97,7 @@ impl Lookup {
     }
 
     /// Returns a borrowed iterator of the returned records wrapped in a dnssec Proven type
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     pub fn dnssec_record_iter(&self) -> DnssecLookupRecordIter<'_> {
         DnssecLookupRecordIter(self.records.iter())
     }
@@ -139,6 +132,14 @@ impl Lookup {
         let valid_until = min(self.valid_until(), other.valid_until());
         Self::new_with_deadline(self.query.clone(), Arc::from(records), valid_until)
     }
+
+    /// Add new records to this lookup, without creating a new Lookup
+    pub fn extend_records(&mut self, other: Vec<Record>) {
+        let mut records = Vec::with_capacity(self.len() + other.len());
+        records.extend_from_slice(&self.records);
+        records.extend(other);
+        self.records = Arc::from(records);
+    }
 }
 
 /// Borrowed view of set of [`RData`]s returned from a Lookup
@@ -153,11 +154,10 @@ impl<'a> Iterator for LookupIter<'a> {
 }
 
 /// An iterator over record data with all data wrapped in a Proven type for dnssec validation
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 pub struct DnssecIter<'a>(DnssecLookupRecordIter<'a>);
 
-#[cfg(feature = "dnssec")]
-
+#[cfg(feature = "dnssec-ring")]
 impl<'a> Iterator for DnssecIter<'a> {
     type Item = Proven<&'a RData>;
 
@@ -178,11 +178,10 @@ impl<'a> Iterator for LookupRecordIter<'a> {
 }
 
 /// An iterator over record data with all data wrapped in a Proven type for dnssec validation
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 pub struct DnssecLookupRecordIter<'a>(Iter<'a, Record>);
 
-#[cfg(feature = "dnssec")]
-
+#[cfg(feature = "dnssec-ring")]
 impl<'a> Iterator for DnssecLookupRecordIter<'a> {
     type Item = Proven<&'a Record>;
 
@@ -196,8 +195,7 @@ impl IntoIterator for Lookup {
     type Item = RData;
     type IntoIter = LookupIntoIter;
 
-    /// This is most likely not a free conversion, the `RData`s will be cloned if data is
-    ///  held behind an Arc with more than one reference (which is most likely the case coming from cache)
+    /// This is not a free conversion, because the `RData`s are cloned.
     fn into_iter(self) -> Self::IntoIter {
         LookupIntoIter {
             records: Arc::clone(&self.records),
@@ -208,9 +206,8 @@ impl IntoIterator for Lookup {
 
 /// Borrowed view of set of [`RData`]s returned from a [`Lookup`].
 ///
-/// This is not usually a zero overhead `Iterator`, it may result in clones of the [`RData`].
+/// This is not a zero overhead `Iterator`, because it clones each [`RData`].
 pub struct LookupIntoIter {
-    // the result of the try_unwrap on Arc
     records: Arc<[Record]>,
     index: usize,
 }
@@ -230,8 +227,7 @@ impl Iterator for LookupIntoIter {
 #[doc(hidden)]
 pub enum LookupEither<P: ConnectionProvider + Send> {
     Retry(RetryDnsHandle<NameServerPool<P>>),
-    #[cfg(feature = "dnssec")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "dnssec")))]
+    #[cfg(feature = "dnssec-ring")]
     Secure(DnssecDnsHandle<RetryDnsHandle<NameServerPool<P>>>),
 }
 
@@ -239,146 +235,18 @@ impl<P: ConnectionProvider> DnsHandle for LookupEither<P> {
     type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send>>;
 
     fn is_verifying_dnssec(&self) -> bool {
-        match *self {
-            Self::Retry(ref c) => c.is_verifying_dnssec(),
-            #[cfg(feature = "dnssec")]
-            Self::Secure(ref c) => c.is_verifying_dnssec(),
+        match self {
+            Self::Retry(c) => c.is_verifying_dnssec(),
+            #[cfg(feature = "dnssec-ring")]
+            Self::Secure(c) => c.is_verifying_dnssec(),
         }
     }
 
     fn send<R: Into<DnsRequest> + Unpin + Send + 'static>(&self, request: R) -> Self::Response {
-        match *self {
-            Self::Retry(ref c) => c.send(request),
-            #[cfg(feature = "dnssec")]
-            Self::Secure(ref c) => c.send(request),
-        }
-    }
-}
-
-/// The Future returned from [`AsyncResolver`] when performing a lookup.
-#[doc(hidden)]
-pub struct LookupFuture<C>
-where
-    C: DnsHandle + 'static,
-{
-    client_cache: CachingClient<C>,
-    names: Vec<Name>,
-    record_type: RecordType,
-    options: DnsRequestOptions,
-    query: Pin<Box<dyn Future<Output = Result<Lookup, ResolveError>> + Send>>,
-}
-
-impl<C> LookupFuture<C>
-where
-    C: DnsHandle + 'static,
-{
-    /// Perform a lookup from a name and type to a set of RDatas
-    ///
-    /// # Arguments
-    ///
-    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
-    /// * `record_type` - type of record being sought
-    /// * `client_cache` - cache with a connection to use for performing all lookups
-    #[doc(hidden)]
-    pub fn lookup(
-        names: Vec<Name>,
-        record_type: RecordType,
-        options: DnsRequestOptions,
-        client_cache: CachingClient<C>,
-    ) -> Self {
-        Self::lookup_with_hosts(names, record_type, options, client_cache, None)
-    }
-
-    /// Perform a lookup from a name and type to a set of RDatas, taking the local
-    /// hosts file into account.
-    ///
-    /// # Arguments
-    ///
-    /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
-    /// * `record_type` - type of record being sought
-    /// * `client_cache` - cache with a connection to use for performing all lookups
-    /// * `hosts` - the local host file, the records inside it will be prioritized over the upstream DNS server
-    #[doc(hidden)]
-    pub fn lookup_with_hosts(
-        mut names: Vec<Name>,
-        record_type: RecordType,
-        options: DnsRequestOptions,
-        mut client_cache: CachingClient<C>,
-        hosts: Option<Arc<Hosts>>,
-    ) -> Self {
-        let name = names.pop().ok_or_else(|| {
-            ResolveError::from(ResolveErrorKind::Message("can not lookup for no names"))
-        });
-
-        let query: Pin<Box<dyn Future<Output = Result<Lookup, ResolveError>> + Send>> = match name {
-            Ok(name) => {
-                let query = Query::query(name, record_type);
-
-                if let Some(lookup) = hosts.and_then(|h| h.lookup_static_host(&query)) {
-                    future::ok(lookup).boxed()
-                } else {
-                    client_cache.lookup(query, options).boxed()
-                }
-            }
-            Err(err) => future::err(err).boxed(),
-        };
-
-        Self {
-            client_cache,
-            names,
-            record_type,
-            options,
-            query,
-        }
-    }
-}
-
-impl<C> Future for LookupFuture<C>
-where
-    C: DnsHandle + 'static,
-{
-    type Output = Result<Lookup, ResolveError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            // Try polling the underlying DNS query.
-            let query = self.query.as_mut().poll_unpin(cx);
-
-            // Determine whether or not we will attempt to retry the query.
-            let should_retry = match query {
-                // If the query is NotReady, yield immediately.
-                Poll::Pending => return Poll::Pending,
-                // If the query returned a successful lookup, we will attempt
-                // to retry if the lookup is empty. Otherwise, we will return
-                // that lookup.
-                Poll::Ready(Ok(ref lookup)) => lookup.records.len() == 0,
-                // If the query failed, we will attempt to retry.
-                Poll::Ready(Err(_)) => true,
-            };
-
-            if should_retry {
-                if let Some(name) = self.names.pop() {
-                    let record_type = self.record_type;
-                    let options = self.options;
-
-                    // If there's another name left to try, build a new query
-                    // for that next name and continue looping.
-                    self.query = self
-                        .client_cache
-                        .lookup(Query::query(name, record_type), options);
-                    // Continue looping with the new query. It will be polled
-                    // on the next iteration of the loop.
-                    continue;
-                }
-            }
-            // If we didn't have to retry the query, or we weren't able to
-            // retry because we've exhausted the names to search, return the
-            // current query.
-            return query;
-            // If we skipped retrying the  query, this will return the
-            // successful lookup, otherwise, if the retry failed, this will
-            // return the last  query result --- either an empty lookup or the
-            // last error we saw.
+        match self {
+            Self::Retry(c) => c.send(request),
+            #[cfg(feature = "dnssec-ring")]
+            Self::Secure(c) => c.send(request),
         }
     }
 }
@@ -427,8 +295,8 @@ impl<'i> Iterator for SrvLookupIter<'i> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let iter: &mut _ = &mut self.0;
-        iter.find_map(|rdata| match *rdata {
-            RData::SRV(ref data) => Some(data),
+        iter.find_map(|rdata| match rdata {
+            RData::SRV(data) => Some(data),
             _ => None,
         })
     }
@@ -438,8 +306,7 @@ impl IntoIterator for SrvLookup {
     type Item = rdata::SRV;
     type IntoIter = SrvLookupIntoIter;
 
-    /// This is most likely not a free conversion, the RDatas will be cloned if data is
-    ///  held behind an Arc with more than one reference (which is most likely the case coming from cache)
+    /// This is not a free conversion, because the `RData`s are cloned.
     fn into_iter(self) -> Self::IntoIter {
         SrvLookupIntoIter(self.0.into_iter())
     }
@@ -511,8 +378,8 @@ macro_rules! lookup_type {
 
             fn next(&mut self) -> Option<Self::Item> {
                 let iter: &mut _ = &mut self.0;
-                iter.find_map(|rdata| match *rdata {
-                    $r(ref data) => Some(data),
+                iter.find_map(|rdata| match rdata {
+                    $r(data) => Some(data),
                     _ => None,
                 })
             }
@@ -522,8 +389,7 @@ macro_rules! lookup_type {
             type Item = $t;
             type IntoIter = $ii;
 
-            /// This is most likely not a free conversion, the RDatas will be cloned if data is
-            ///  held behind an Arc with more than one reference (which is most likely the case coming from cache)
+            /// This is not a free conversion, because the `RData`s are cloned.
             fn into_iter(self) -> Self::IntoIter {
                 $ii(self.0.into_iter())
             }
@@ -584,6 +450,13 @@ lookup_type!(
     rdata::TXT
 );
 lookup_type!(
+    CertLookup,
+    CertLookupIter,
+    CertLookupIntoIter,
+    RData::CERT,
+    rdata::CERT
+);
+lookup_type!(
     SoaLookup,
     SoaLookupIter,
     SoaLookupIntoIter,
@@ -593,155 +466,15 @@ lookup_type!(
 lookup_type!(NsLookup, NsLookupIter, NsLookupIntoIter, RData::NS, NS);
 
 #[cfg(test)]
-pub mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+mod tests {
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use futures_executor::block_on;
-    use futures_util::future;
-    use futures_util::stream::once;
-
-    use hickory_proto::error::ProtoErrorKind;
-    use proto::error::ProtoError;
-    use proto::op::{Message, Query};
-    use proto::rr::{Name, RData, Record, RecordType};
-    use proto::xfer::{DnsRequest, DnsRequestOptions};
+    #[cfg(feature = "dnssec-ring")]
+    use crate::proto::op::Query;
+    use crate::proto::rr::{Name, RData, Record};
 
     use super::*;
-
-    #[derive(Clone)]
-    pub struct MockDnsHandle {
-        messages: Arc<Mutex<Vec<Result<DnsResponse, ProtoError>>>>,
-    }
-
-    impl DnsHandle for MockDnsHandle {
-        type Response = Pin<Box<dyn Stream<Item = Result<DnsResponse, ProtoError>> + Send>>;
-
-        fn send<R: Into<DnsRequest>>(&self, _: R) -> Self::Response {
-            Box::pin(once(
-                future::ready(self.messages.lock().unwrap().pop().unwrap_or_else(empty)).boxed(),
-            ))
-        }
-    }
-
-    pub fn v4_message() -> Result<DnsResponse, ProtoError> {
-        let mut message = Message::new();
-        message.add_query(Query::query(Name::root(), RecordType::A));
-        message.insert_answers(vec![Record::from_rdata(
-            Name::root(),
-            86400,
-            RData::A(A::new(127, 0, 0, 1)),
-        )]);
-
-        let resp = DnsResponse::from_message(message).unwrap();
-        assert!(resp.contains_answer());
-        Ok(resp)
-    }
-
-    pub fn empty() -> Result<DnsResponse, ProtoError> {
-        Ok(DnsResponse::from_message(Message::new()).unwrap())
-    }
-
-    pub fn error() -> Result<DnsResponse, ProtoError> {
-        Err(ProtoError::from(std::io::Error::from(
-            std::io::ErrorKind::Other,
-        )))
-    }
-
-    pub fn mock(messages: Vec<Result<DnsResponse, ProtoError>>) -> MockDnsHandle {
-        MockDnsHandle {
-            messages: Arc::new(Mutex::new(messages)),
-        }
-    }
-
-    #[test]
-    fn test_lookup() {
-        assert_eq!(
-            block_on(LookupFuture::lookup(
-                vec![Name::root()],
-                RecordType::A,
-                DnsRequestOptions::default(),
-                CachingClient::new(0, mock(vec![v4_message()]), false),
-            ))
-            .unwrap()
-            .iter()
-            .map(|r| r.ip_addr().unwrap())
-            .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
-        );
-    }
-
-    #[test]
-    fn test_lookup_slice() {
-        assert_eq!(
-            Record::data(
-                &block_on(LookupFuture::lookup(
-                    vec![Name::root()],
-                    RecordType::A,
-                    DnsRequestOptions::default(),
-                    CachingClient::new(0, mock(vec![v4_message()]), false),
-                ))
-                .unwrap()
-                .records()[0]
-            )
-            .ip_addr()
-            .unwrap(),
-            Ipv4Addr::new(127, 0, 0, 1)
-        );
-    }
-
-    #[test]
-    fn test_lookup_into_iter() {
-        assert_eq!(
-            block_on(LookupFuture::lookup(
-                vec![Name::root()],
-                RecordType::A,
-                DnsRequestOptions::default(),
-                CachingClient::new(0, mock(vec![v4_message()]), false),
-            ))
-            .unwrap()
-            .into_iter()
-            .map(|r| r.ip_addr().unwrap())
-            .collect::<Vec<IpAddr>>(),
-            vec![Ipv4Addr::new(127, 0, 0, 1)]
-        );
-    }
-
-    #[test]
-    fn test_error() {
-        assert!(block_on(LookupFuture::lookup(
-            vec![Name::root()],
-            RecordType::A,
-            DnsRequestOptions::default(),
-            CachingClient::new(0, mock(vec![error()]), false),
-        ))
-        .is_err());
-    }
-
-    #[test]
-    fn test_empty_no_response() {
-        if let ProtoErrorKind::NoRecordsFound {
-            query,
-            negative_ttl,
-            ..
-        } = block_on(LookupFuture::lookup(
-            vec![Name::root()],
-            RecordType::A,
-            DnsRequestOptions::default(),
-            CachingClient::new(0, mock(vec![empty()]), false),
-        ))
-        .expect_err("this should have been a NoRecordsFound")
-        .proto()
-        .expect("it should have been a ProtoError")
-        .kind()
-        {
-            assert_eq!(**query, Query::query(Name::root(), RecordType::A));
-            assert_eq!(*negative_ttl, None);
-        } else {
-            panic!("wrong error received");
-        }
-    }
 
     #[test]
     fn test_lookup_into_iter_arc() {
@@ -767,9 +500,9 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     fn test_dnssec_lookup() {
-        use hickory_proto::rr::dnssec::Proof;
+        use hickory_proto::dnssec::Proof;
 
         let mut a1 = Record::from_rdata(
             Name::from_str("www.example.com.").unwrap(),

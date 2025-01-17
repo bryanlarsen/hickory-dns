@@ -13,11 +13,13 @@ use std::{
     time::*,
 };
 
-use hickory_client::{client::*, error::ClientError, proto::xfer::DnsResponse};
-#[cfg(feature = "dnssec")]
-use hickory_proto::rr::dnssec::*;
-use hickory_proto::rr::{rdata::A, *};
-use hickory_server::server::Protocol;
+#[cfg(feature = "dnssec-ring")]
+use hickory_client::client::Client;
+use hickory_client::{client::ClientHandle, proto::xfer::DnsResponse, ClientError};
+#[cfg(feature = "dnssec-ring")]
+use hickory_proto::dnssec::{Algorithm, SupportedAlgorithms};
+use hickory_proto::rr::{rdata::A, DNSClass, Name, RData, RecordType};
+use hickory_proto::xfer::Protocol;
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
@@ -61,7 +63,7 @@ impl SocketPorts {
     }
 }
 
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 use self::mut_message_client::MutMessageHandle;
 
 fn collect_and_print<R: BufRead>(read: &mut R, output: &mut String) {
@@ -185,8 +187,11 @@ where
             match proto {
                 "UDP" => socket_ports.put(Protocol::Udp, socket_addr),
                 "TCP" => socket_ports.put(Protocol::Tcp, socket_addr),
+                #[cfg(feature = "dns-over-rustls")]
                 "TLS" => socket_ports.put(Protocol::Tls, socket_addr),
+                #[cfg(feature = "dns-over-https-rustls")]
                 "HTTPS" => socket_ports.put(Protocol::Https, socket_addr),
+                #[cfg(feature = "dns-over-quic")]
                 "QUIC" => socket_ports.put(Protocol::Quic, socket_addr),
                 _ => panic!("unsupported protocol: {proto}"),
             }
@@ -247,11 +252,11 @@ pub fn query_message<C: ClientHandle>(
 //  i.e. more complex checks live with the clients and authorities to validate deeper functionality
 #[allow(dead_code)]
 pub fn query_a<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
-    let name = Name::from_str("www.example.com").unwrap();
+    let name = Name::from_str("www.example.com.").unwrap();
     let response = query_message(io_loop, client, name, RecordType::A).unwrap();
     let record = &response.answers()[0];
 
-    if let RData::A(ref address) = record.data() {
+    if let RData::A(address) = record.data() {
         assert_eq!(address, &A::new(127, 0, 0, 1))
     } else {
         panic!("wrong RDATA")
@@ -262,7 +267,7 @@ pub fn query_a<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
 //  i.e. more complex checks live with the clients and authorities to validate deeper functionality
 #[allow(dead_code)]
 pub fn query_a_refused<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
-    let name = Name::from_str("www.example.com").unwrap();
+    let name = Name::from_str("www.example.com.").unwrap();
     let error =
         query_message(io_loop, client, name, RecordType::A).expect_err("Expected an Error here");
 
@@ -276,14 +281,17 @@ pub fn query_a_refused<C: ClientHandle>(io_loop: &mut Runtime, client: &mut C) {
 // This only validates that a query to the server works, it shouldn't be used for more than this.
 //  i.e. more complex checks live with the clients and authorities to validate deeper functionality
 #[allow(dead_code)]
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 pub fn query_all_dnssec(
     io_loop: &mut Runtime,
-    client: AsyncClient,
+    client: Client,
     algorithm: Algorithm,
     with_rfc6975: bool,
 ) {
-    use hickory_proto::rr::dnssec::rdata::{DNSKEY, RRSIG};
+    use hickory_proto::{
+        dnssec::rdata::{DNSKEY, RRSIG},
+        rr::{Record, RecordData},
+    };
 
     let name = Name::from_str("example.com.").unwrap();
     let mut client = MutMessageHandle::new(client);
@@ -317,21 +325,13 @@ pub fn query_all_dnssec(
 }
 
 #[allow(dead_code)]
-#[cfg(feature = "dnssec")]
-pub fn query_all_dnssec_with_rfc6975(
-    io_loop: &mut Runtime,
-    client: AsyncClient,
-    algorithm: Algorithm,
-) {
+#[cfg(feature = "dnssec-ring")]
+pub fn query_all_dnssec_with_rfc6975(io_loop: &mut Runtime, client: Client, algorithm: Algorithm) {
     query_all_dnssec(io_loop, client, algorithm, true)
 }
 
 #[allow(dead_code)]
-#[cfg(feature = "dnssec")]
-pub fn query_all_dnssec_wo_rfc6975(
-    io_loop: &mut Runtime,
-    client: AsyncClient,
-    algorithm: Algorithm,
-) {
+#[cfg(feature = "dnssec-ring")]
+pub fn query_all_dnssec_wo_rfc6975(io_loop: &mut Runtime, client: Client, algorithm: Algorithm) {
     query_all_dnssec(io_loop, client, algorithm, false)
 }

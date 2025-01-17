@@ -14,25 +14,24 @@ use std::sync::Arc;
 use std::{fmt, io, sync};
 
 #[cfg(feature = "backtrace")]
-#[cfg_attr(docsrs, doc(cfg(feature = "backtrace")))]
 pub use backtrace::Backtrace as ExtBacktrace;
 use enum_as_inner::EnumAsInner;
 #[cfg(feature = "backtrace")]
 use once_cell::sync::Lazy;
+#[cfg(feature = "dnssec-ring")]
+use ring::error::Unspecified;
 use thiserror::Error;
 use tracing::debug;
 
+#[cfg(feature = "dnssec-ring")]
+use crate::dnssec::Proof;
 use crate::op::{Header, Query, ResponseCode};
-
-#[cfg(feature = "dnssec")]
-use crate::rr::dnssec::{rdata::tsig::TsigAlgorithm, Proof};
-use crate::rr::{rdata::SOA, resource::RecordRef, Record, RecordType};
+use crate::rr::{domain::Name, rdata::SOA, resource::RecordRef, Record, RecordType};
 use crate::serialize::binary::DecodeError;
 use crate::xfer::DnsResponse;
 
 /// Boolean for checking if backtrace is enabled at runtime
 #[cfg(feature = "backtrace")]
-#[cfg_attr(docsrs, doc(cfg(feature = "backtrace")))]
 pub static ENABLE_BACKTRACE: Lazy<bool> = Lazy::new(|| {
     use std::env;
     let bt = env::var("RUST_BACKTRACE");
@@ -43,13 +42,12 @@ pub static ENABLE_BACKTRACE: Lazy<bool> = Lazy::new(|| {
 ///
 /// If RUST_BACKTRACE is 1 or full then this will return Some(Backtrace), otherwise, NONE.
 #[cfg(feature = "backtrace")]
-#[cfg_attr(docsrs, doc(cfg(feature = "backtrace")))]
 #[macro_export]
 macro_rules! trace {
     () => {{
-        use $crate::error::ExtBacktrace as Backtrace;
+        use $crate::ExtBacktrace as Backtrace;
 
-        if *$crate::error::ENABLE_BACKTRACE {
+        if *$crate::ENABLE_BACKTRACE {
             Some(Backtrace::new())
         } else {
             None
@@ -58,7 +56,7 @@ macro_rules! trace {
 }
 
 /// An alias for results returned by functions of this crate
-pub type ProtoResult<T> = ::std::result::Result<T, ProtoError>;
+pub(crate) type ProtoResult<T> = ::std::result::Result<T, ProtoError>;
 
 /// The error kind for errors that get returned in the crate
 #[derive(Debug, EnumAsInner, Error)]
@@ -99,11 +97,11 @@ pub enum ProtoErrorKind {
     },
 
     /// No Records and there is a corresponding DNSSEC Proof for NSEC
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     #[error("DNSSEC Negative Record Response for {query}, {proof}")]
     Nsec {
         /// Query for which the NSEC was returned
-        query: crate::op::Query,
+        query: Box<Query>,
         /// DNSSEC proof of the record
         proof: Proof,
     },
@@ -125,13 +123,9 @@ pub enum ProtoErrorKind {
     FormError {
         /// Header of the bad Message
         header: Header,
-        /// Error that occured while parsing the Message
+        /// Error that occurred while parsing the Message
         error: Box<ProtoError>,
     },
-
-    /// An HMAC failed to verify
-    #[error("hmac validation failure")]
-    HmacInvalid(),
 
     /// The length of rdata read was not as expected
     #[error("incorrect rdata length read: {read} expected: {len}")]
@@ -158,6 +152,15 @@ pub enum ProtoErrorKind {
     /// The maximum buffer size was exceeded
     #[error("maximum buffer size exceeded: {0}")]
     MaxBufferSizeExceeded(usize),
+
+    /// Maximum record limit was exceeded
+    #[error("maximum record limit for {record_type} exceeded: {count} records")]
+    MaxRecordLimitExceeded {
+        /// number of records
+        count: usize,
+        /// The record type that triggered the error.
+        record_type: RecordType,
+    },
 
     /// An error with an arbitrary message, referenced as &'static str
     #[error("{0}")]
@@ -191,7 +194,7 @@ pub enum ProtoErrorKind {
         soa: Option<Box<Record<SOA>>>,
         /// Nameservers may be present in addition to or in lieu of an SOA for a referral
         /// The tuple struct layout is vec[(Nameserver, [vec of glue records])]
-        ns: Option<Vec<ForwardNSData>>,
+        ns: Option<Arc<[ForwardNSData]>>,
         /// negative ttl, as determined from DnsResponse::negative_ttl
         ///  this will only be present if the SOA was also present.
         negative_ttl: Option<u32>,
@@ -200,6 +203,8 @@ pub enum ProtoErrorKind {
         response_code: ResponseCode,
         /// If we trust `NXDOMAIN` errors from this server
         trusted: bool,
+        /// Authority records from the query. These are important to preserve for DNSSEC validation.
+        authorities: Option<Arc<[Record]>>,
     },
 
     /// An unknown algorithm type was found
@@ -248,12 +253,9 @@ pub enum ProtoErrorKind {
     RequestRefused,
 
     /// A ring error
+    #[cfg(feature = "dnssec-ring")]
     #[error("ring error: {0}")]
     Ring(#[from] Unspecified),
-
-    /// An ssl error
-    #[error("ssl error: {0}")]
-    SSL(#[from] SslErrorStack),
 
     /// A tokio timer error
     #[error("timer error")]
@@ -262,16 +264,6 @@ pub enum ProtoErrorKind {
     /// A request timed out
     #[error("request timed out")]
     Timeout,
-
-    /// Tsig key verification failed
-    #[error("Tsig key wrong key error")]
-    TsigWrongKey,
-
-    /// Tsig unsupported mac algorithm
-    /// Supported algorithm documented in `TsigAlgorithm::supported` function.
-    #[cfg(feature = "dnssec")]
-    #[error("Tsig unsupported mac algorithm")]
-    TsigUnsupportedMacAlgorithm(TsigAlgorithm),
 
     /// An url parsing error
     #[error("url parsing error")]
@@ -340,9 +332,57 @@ pub enum ProtoErrorKind {
     RustlsError(#[from] rustls::Error),
 
     /// No valid certificates found in the native root store.
-    #[cfg(all(feature = "native-certs", not(feature = "webpki-roots")))]
+    #[cfg(feature = "native-certs")]
     #[error("no valid certificates found in the native root store")]
     NativeCerts,
+}
+
+/// Data needed to process a SOA-record-based referral.
+#[derive(Clone, Debug)]
+pub struct ForwardData {
+    /// Query
+    pub query: Box<Query>,
+    /// Name
+    pub name: Name,
+    /// SOA
+    pub soa: Box<Record<SOA>>,
+    /// No records found?
+    no_records_found: bool,
+    /// IS nx domain?
+    nx_domain: bool,
+    /// Authority records
+    pub authorities: Option<Arc<[Record]>>,
+}
+
+impl ForwardData {
+    /// Construct a new ForwardData
+    pub fn new(
+        query: Box<Query>,
+        name: Name,
+        soa: Box<Record<SOA>>,
+        no_records_found: bool,
+        nx_domain: bool,
+        authorities: Option<Arc<[Record]>>,
+    ) -> Self {
+        Self {
+            query,
+            name,
+            soa,
+            no_records_found,
+            nx_domain,
+            authorities,
+        }
+    }
+
+    /// are there records?
+    pub fn is_no_records_found(&self) -> bool {
+        self.no_records_found
+    }
+
+    /// is this nxdomain?
+    pub fn is_nx_domain(&self) -> bool {
+        self.nx_domain
+    }
 }
 
 /// Data needed to process a NS-record-based referral.
@@ -351,14 +391,14 @@ pub struct ForwardNSData {
     /// The referant NS record
     pub ns: Record,
     /// Any glue records associated with the referant NS record.
-    pub glue: Vec<Record>,
+    pub glue: Arc<[Record]>,
 }
 
 /// The error type for errors that get returned in the crate
 #[derive(Error, Clone, Debug)]
 #[non_exhaustive]
 pub struct ProtoError {
-    /// Kind of error that ocurred
+    /// Kind of error that occurred
     pub kind: Box<ProtoErrorKind>,
     /// Backtrace to the source of the error
     #[cfg(feature = "backtrace")]
@@ -369,20 +409,22 @@ impl ProtoError {
     /// Constructor to NX type errors
     #[inline]
     pub fn nx_error(
-        query: Query,
-        soa: Option<Record<SOA>>,
-        ns: Option<Vec<ForwardNSData>>,
+        query: Box<Query>,
+        soa: Option<Box<Record<SOA>>>,
+        ns: Option<Arc<[ForwardNSData]>>,
         negative_ttl: Option<u32>,
         response_code: ResponseCode,
         trusted: bool,
+        authorities: Option<Arc<[Record]>>,
     ) -> Self {
         ProtoErrorKind::NoRecordsFound {
-            query: Box::new(query),
-            soa: soa.map(Box::new),
+            query,
+            soa,
             ns,
             negative_ttl,
             response_code,
             trusted,
+            authorities,
         }
         .into()
     }
@@ -445,7 +487,7 @@ impl ProtoError {
     /// A conversion to determine if the response is an error
     pub fn from_response(response: DnsResponse, trust_nx: bool) -> Result<DnsResponse, Self> {
         use ResponseCode::*;
-        debug!("Response:{}", *response);
+        debug!("response: {}", *response);
 
         match response.response_code() {
                 code @ ServFail
@@ -466,7 +508,6 @@ impl ProtoError {
                 | code @ BADALG
                 | code @ BADTRUNC
                 | code @ BADCOOKIE => {
-                    let response = response;
                     let soa = response.soa().as_ref().map(RecordRef::to_owned);
                     let query = response.queries().iter().next().cloned().unwrap_or_default();
                     let error_kind = ProtoErrorKind::NoRecordsFound {
@@ -478,6 +519,7 @@ impl ProtoError {
                         // This is marked as false as these are all potentially temporary error Response codes about
                         //   the client and server interaction, and do not pertain to record existence.
                         trusted: false,
+                        authorities: None,
                     };
 
                     Err(Self::from(error_kind))
@@ -489,8 +531,6 @@ impl ProtoError {
                 if !response.contains_answer() && !response.truncated() => {
                     // TODO: if authoritative, this is cacheable, store a TTL (currently that requires time, need a "now" here)
                     // let valid_until = if response.authoritative() { now + response.negative_ttl() };
-
-                    let response = response;
                     let soa = response.soa().as_ref().map(RecordRef::to_owned);
 
                     // Collect any referral nameservers and associated glue records
@@ -510,11 +550,17 @@ impl ProtoError {
                                 None
                             })
                             .collect::<Vec<Record>>();
-                        referral_name_servers.push(ForwardNSData { ns: Record::to_owned(ns), glue })
+                        referral_name_servers.push(ForwardNSData { ns: Record::to_owned(ns), glue: glue.into() })
                     }
 
                     let option_ns = if !referral_name_servers.is_empty() {
-                        Some(referral_name_servers)
+                        Some(referral_name_servers.into())
+                    } else {
+                        None
+                    };
+
+                    let authorities = if ! response.name_servers().is_empty() {
+                        Some(response.name_servers().to_owned().into())
                     } else {
                         None
                     };
@@ -526,6 +572,7 @@ impl ProtoError {
                     // for local hosts.
                     let trusted = trust_nx && soa.is_some();
                     let query = response.into_message().take_queries().drain(..).next().unwrap_or_default();
+
                     let error_kind = ProtoErrorKind::NoRecordsFound {
                         query: Box::new(query),
                         soa: soa.map(Box::new),
@@ -533,6 +580,7 @@ impl ProtoError {
                         negative_ttl,
                         response_code: code,
                         trusted,
+                        authorities,
                     };
 
                     Err(Self::from(error_kind))
@@ -579,7 +627,7 @@ impl fmt::Display for ProtoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cfg_if::cfg_if! {
             if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
+                if let Some(backtrace) = &self.backtrack {
                     fmt::Display::fmt(&self.kind, f)?;
                     fmt::Debug::fmt(backtrace, f)
                 } else {
@@ -654,7 +702,7 @@ impl<T> From<sync::PoisonError<T>> for ProtoError {
 
 impl From<ProtoError> for io::Error {
     fn from(e: ProtoError) -> Self {
-        match *e.kind() {
+        match e.kind() {
             ProtoErrorKind::Timeout => Self::new(io::ErrorKind::TimedOut, e),
             _ => Self::new(io::ErrorKind::Other, e),
         }
@@ -668,7 +716,6 @@ impl From<ProtoError> for String {
 }
 
 #[cfg(feature = "wasm-bindgen")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wasm-bindgen")))]
 impl From<ProtoError> for wasm_bindgen_crate::JsValue {
     fn from(e: ProtoError) -> Self {
         js_sys::Error::new(&e.to_string()).into()
@@ -691,11 +738,13 @@ impl Clone for ProtoErrorKind {
                 header,
                 error: error.clone(),
             },
-            HmacInvalid() => HmacInvalid(),
             IncorrectRDataLengthRead { read, len } => IncorrectRDataLengthRead { read, len },
             LabelBytesTooLong(len) => LabelBytesTooLong(len),
             PointerNotPriorToLabel { idx, ptr } => PointerNotPriorToLabel { idx, ptr },
             MaxBufferSizeExceeded(max) => MaxBufferSizeExceeded(max),
+            MaxRecordLimitExceeded { count, record_type } => {
+                MaxRecordLimitExceeded { count, record_type }
+            }
             Message(msg) => Message(msg),
             Msg(ref msg) => Msg(msg.clone()),
             NoConnections => NoConnections,
@@ -708,6 +757,7 @@ impl Clone for ProtoErrorKind {
                 negative_ttl,
                 response_code,
                 trusted,
+                ref authorities,
             } => NoRecordsFound {
                 query: query.clone(),
                 soa: soa.clone(),
@@ -715,9 +765,10 @@ impl Clone for ProtoErrorKind {
                 negative_ttl,
                 response_code,
                 trusted,
+                authorities: authorities.clone(),
             },
             RequestRefused => RequestRefused,
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             Nsec { ref query, proof } => Nsec {
                 query: query.clone(),
                 proof,
@@ -732,13 +783,10 @@ impl Clone for ProtoErrorKind {
             UnrecognizedCsyncFlags(flags) => UnrecognizedCsyncFlags(flags),
             Io(ref e) => Io(e.clone()),
             Poisoned => Poisoned,
+            #[cfg(feature = "dnssec-ring")]
             Ring(ref _e) => Ring(Unspecified),
-            SSL(ref e) => Msg(format!("there was an SSL error: {e}")),
             Timeout => Timeout,
             Timer => Timer,
-            #[cfg(feature = "dnssec")]
-            TsigUnsupportedMacAlgorithm(ref alg) => TsigUnsupportedMacAlgorithm(alg.clone()),
-            TsigWrongKey => TsigWrongKey,
             UrlParsing(ref e) => UrlParsing(*e),
             Utf8(ref e) => Utf8(*e),
             FromUtf8(ref e) => FromUtf8(e.clone()),
@@ -763,223 +811,8 @@ impl Clone for ProtoErrorKind {
             QuinnUnknownStreamError => QuinnUnknownStreamError,
             #[cfg(feature = "rustls")]
             RustlsError(ref e) => RustlsError(e.clone()),
-            #[cfg(all(feature = "native-certs", not(feature = "webpki-roots")))]
+            #[cfg(feature = "native-certs")]
             NativeCerts => NativeCerts,
-        }
-    }
-}
-
-/// A trait marking a type which implements `From<ProtoError>` and
-/// std::error::Error types as well as Clone + Send
-pub trait FromProtoError: From<ProtoError> + std::error::Error + Clone {}
-
-impl<E> FromProtoError for E where E: From<ProtoError> + std::error::Error + Clone {}
-
-#[cfg(not(any(feature = "dns-over-openssl", feature = "dnssec-openssl")))]
-use self::not_openssl::SslErrorStack;
-#[cfg(not(feature = "dnssec-ring"))]
-use self::not_ring::{KeyRejected, Unspecified};
-#[cfg(any(feature = "dns-over-openssl", feature = "dnssec-openssl"))]
-use openssl::error::ErrorStack as SslErrorStack;
-#[cfg(feature = "dnssec-ring")]
-use ring::error::{KeyRejected, Unspecified};
-
-/// An alias for dnssec results returned by functions of this crate
-pub type DnsSecResult<T> = ::std::result::Result<T, DnsSecError>;
-
-/// The error kind for dnssec errors that get returned in the crate
-#[allow(unreachable_pub)]
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum DnsSecErrorKind {
-    /// An error with an arbitrary message, referenced as &'static str
-    #[error("{0}")]
-    Message(&'static str),
-
-    /// An error with an arbitrary message, stored as String
-    #[error("{0}")]
-    Msg(String),
-
-    // foreign
-    /// An error got returned by the hickory-proto crate
-    #[error("proto error: {0}")]
-    Proto(#[from] ProtoError),
-
-    /// A ring error
-    #[error("ring error: {0}")]
-    RingKeyRejected(#[from] KeyRejected),
-
-    /// A ring error
-    #[error("ring error: {0}")]
-    RingUnspecified(#[from] Unspecified),
-
-    /// An ssl error
-    #[error("ssl error: {0}")]
-    SSL(#[from] SslErrorStack),
-
-    /// A request timed out
-    #[error("request timed out")]
-    Timeout,
-}
-
-impl Clone for DnsSecErrorKind {
-    fn clone(&self) -> Self {
-        use DnsSecErrorKind::*;
-        match self {
-            Message(msg) => Message(msg),
-            Msg(ref msg) => Msg(msg.clone()),
-
-            // foreign
-            Proto(proto) => Proto(proto.clone()),
-            RingKeyRejected(r) => Msg(format!("Ring rejected key: {r}")),
-            RingUnspecified(_r) => RingUnspecified(Unspecified),
-            SSL(ssl) => Msg(format!("SSL had an error: {ssl}")),
-            Timeout => Timeout,
-        }
-    }
-}
-
-/// The error type for dnssec errors that get returned in the crate
-#[derive(Debug, Clone, Error)]
-pub struct DnsSecError {
-    kind: DnsSecErrorKind,
-    #[cfg(feature = "backtrace")]
-    backtrack: Option<ExtBacktrace>,
-}
-
-impl DnsSecError {
-    /// Get the kind of the error
-    pub fn kind(&self) -> &DnsSecErrorKind {
-        &self.kind
-    }
-}
-
-impl fmt::Display for DnsSecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "backtrace")] {
-                if let Some(ref backtrace) = self.backtrack {
-                    fmt::Display::fmt(&self.kind, f)?;
-                    fmt::Debug::fmt(backtrace, f)
-                } else {
-                    fmt::Display::fmt(&self.kind, f)
-                }
-            } else {
-                fmt::Display::fmt(&self.kind, f)
-            }
-        }
-    }
-}
-
-impl From<DnsSecErrorKind> for DnsSecError {
-    fn from(kind: DnsSecErrorKind) -> Self {
-        Self {
-            kind,
-            #[cfg(feature = "backtrace")]
-            backtrack: trace!(),
-        }
-    }
-}
-
-impl From<&'static str> for DnsSecError {
-    fn from(msg: &'static str) -> Self {
-        DnsSecErrorKind::Message(msg).into()
-    }
-}
-
-impl From<String> for DnsSecError {
-    fn from(msg: String) -> Self {
-        DnsSecErrorKind::Msg(msg).into()
-    }
-}
-
-impl From<ProtoError> for DnsSecError {
-    fn from(e: ProtoError) -> Self {
-        match *e.kind() {
-            ProtoErrorKind::Timeout => DnsSecErrorKind::Timeout.into(),
-            _ => DnsSecErrorKind::from(e).into(),
-        }
-    }
-}
-
-impl From<KeyRejected> for DnsSecError {
-    fn from(e: KeyRejected) -> Self {
-        DnsSecErrorKind::from(e).into()
-    }
-}
-
-impl From<Unspecified> for DnsSecError {
-    fn from(e: Unspecified) -> Self {
-        DnsSecErrorKind::from(e).into()
-    }
-}
-
-impl From<SslErrorStack> for DnsSecError {
-    fn from(e: SslErrorStack) -> Self {
-        DnsSecErrorKind::from(e).into()
-    }
-}
-
-#[doc(hidden)]
-#[allow(unreachable_pub)]
-#[cfg(not(any(feature = "dns-over-openssl", feature = "dnssec-openssl")))]
-#[cfg_attr(
-    docsrs,
-    doc(cfg(not(any(feature = "dns-over-openssl", feature = "dnssec-openssl"))))
-)]
-pub mod not_openssl {
-    use std;
-
-    #[derive(Clone, Copy, Debug)]
-    pub struct SslErrorStack;
-
-    impl std::fmt::Display for SslErrorStack {
-        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-            Ok(())
-        }
-    }
-
-    impl std::error::Error for SslErrorStack {
-        fn description(&self) -> &str {
-            "openssl feature not enabled"
-        }
-    }
-}
-
-#[doc(hidden)]
-#[allow(unreachable_pub)]
-#[cfg(not(feature = "dnssec-ring"))]
-#[cfg_attr(docsrs, doc(cfg(feature = "dnssec-ring")))]
-pub mod not_ring {
-    use std;
-
-    #[derive(Clone, Copy, Debug)]
-    pub struct KeyRejected;
-
-    #[derive(Clone, Copy, Debug)]
-    pub struct Unspecified;
-
-    impl std::fmt::Display for KeyRejected {
-        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-            Ok(())
-        }
-    }
-
-    impl std::error::Error for KeyRejected {
-        fn description(&self) -> &str {
-            "ring feature not enabled"
-        }
-    }
-
-    impl std::fmt::Display for Unspecified {
-        fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-            Ok(())
-        }
-    }
-
-    impl std::error::Error for Unspecified {
-        fn description(&self) -> &str {
-            "ring feature not enabled"
         }
     }
 }

@@ -4,7 +4,7 @@ name = "hickory-resolver"
 # A short blurb about the package. This is not rendered in any format when
 # uploaded to crates.io (aka this is not markdown)
 description = """
-Hickory DNS is a safe and secure DNS library. This Resolver library  uses the Client library to perform all DNS queries. The Resolver is intended to be a high-level library for any DNS record resolution see Resolver and AsyncResolver for supported resolution types. The Client can be used for other queries.
+Hickory DNS is a safe and secure DNS library. This Resolver library uses the Client library to perform all DNS queries. The Resolver is intended to be a high-level library for any DNS record resolution. See Resolver for supported resolution types. The Client can be used for other queries.
 """
 
 # These URLs point to more information about the repository
@@ -27,24 +27,12 @@ license.workspace = true
 [features]
 default = ["system-config", "tokio-runtime"]
 backtrace = ["dep:backtrace", "hickory-proto/backtrace"]
-dns-over-native-tls = [
-    "dns-over-tls",
-    "dep:tokio-native-tls",
-    "hickory-proto/dns-over-native-tls",
-]
-# DNS over TLS with OpenSSL currently needs a good way to set default CAs, use rustls or native-tls
-dns-over-openssl = [
-    "dns-over-tls",
-    "hickory-proto/dns-over-openssl",
-    "dep:tokio-openssl",
-]
 dns-over-rustls = [
-    "dns-over-tls",
     "dep:rustls",
     "dep:tokio-rustls",
     "hickory-proto/dns-over-rustls",
+    "tokio-runtime",
 ]
-dns-over-tls = ["tokio-runtime"]
 
 # This requires some TLS library, currently only rustls is supported
 dns-over-https-rustls = [
@@ -57,9 +45,7 @@ dns-over-h3 = ["dep:quinn", "dns-over-rustls", "hickory-proto/dns-over-h3"]
 webpki-roots = ["dep:webpki-roots", "hickory-proto/webpki-roots"]
 native-certs = ["dep:rustls-native-certs", "hickory-proto/native-certs"]
 
-dnssec-openssl = ["dnssec", "hickory-proto/dnssec-openssl"]
-dnssec-ring = ["dnssec", "hickory-proto/dnssec-ring"]
-dnssec = []
+dnssec-ring = ["hickory-proto/dnssec-ring"]
 
 serde = ["dep:serde", "hickory-proto/serde"]
 system-config = ["dep:ipconfig", "dep:resolv-conf"]
@@ -77,7 +63,7 @@ cfg-if.workspace = true
 futures-util = { workspace = true, default-features = false, features = [
     "std",
 ] }
-lru-cache.workspace = true
+moka = { workspace = true, features = ["sync"] }
 once_cell.workspace = true
 parking_lot.workspace = true
 quinn = { workspace = true, optional = true, features = [
@@ -89,13 +75,11 @@ rand.workspace = true
 resolv-conf = { workspace = true, optional = true, features = ["system"] }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"], optional = true }
+serde = { workspace = true, features = ["derive", "rc"], optional = true }
 smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, optional = true }
-tokio-native-tls = { workspace = true, optional = true }
-tokio-openssl = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 hickory-proto = { workspace = true, default-features = false }
 webpki-roots = { workspace = true, optional = true }
@@ -105,8 +89,10 @@ ipconfig = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true, default-features = false, features = ["std"] }
+test-support.workspace = true
 tokio = { workspace = true, features = ["macros", "test-util"] }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "std"] }
+toml.workspace = true
+tracing-subscriber.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
@@ -132,3 +118,7 @@ required-features = ["tokio-runtime", "system-config"]
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true
+max_combination_size = 2

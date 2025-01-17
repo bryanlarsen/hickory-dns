@@ -27,7 +27,7 @@
 //!
 //! Unlike the `hickory-client`, this tries to provide a simpler interface to perform DNS queries. For update options, i.e. Dynamic DNS, the `hickory-client` crate must be used instead. The Resolver library is capable of searching multiple domains (this can be disabled by using an FQDN during lookup), dual-stack IPv4/IPv6 lookups, performing chained CNAME lookups, and features connection metric tracking for attempting to pick the best upstream DNS resolver.
 //!
-//! Use [`AsyncResolver`] for performing DNS queries. `AsyncResolver` is a `async-std` based async resolver, and can be used inside any `asyn-std` based system.
+//! Use [`Resolver`] for performing DNS queries. `Resolver` is a `async-std` based async resolver, and can be used inside any `async-std` based system.
 //!
 //! This as best as possible attempts to abide by the DNS RFCs, please file issues at <https://github.com/hickory-dns/hickory-dns>.
 //!
@@ -42,7 +42,7 @@
 //!
 //! ## Using the async-std Resolver
 //!
-//! For more advanced asynchronous usage, the [`AsyncResolver`] is integrated with async-std.
+//! For more advanced asynchronous usage, the [`Resolver`] is integrated with async-std.
 //!
 //! ```rust
 //! use std::net::*;
@@ -64,12 +64,7 @@
 //!
 //!   // There can be many addresses associated with the name,
 //!   //  this can return IPv4 and/or IPv6 addresses
-//!   let address = response.iter().next().expect("no addresses returned!");
-//!   if address.is_ipv4() {
-//!     assert_eq!(address, IpAddr::V4(Ipv4Addr::new(93, 184, 215, 14)));
-//!   } else {
-//!     assert_eq!(address, IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0x6820, 0x80da, 0xaf6b, 0x8b2c)));
-//!   }
+//!   let _address = response.iter().next().expect("no addresses returned!");
 //! }
 //! ```
 //!
@@ -94,7 +89,7 @@
 //! }
 //! ```
 
-use hickory_resolver::AsyncResolver;
+use hickory_resolver::Resolver;
 
 use crate::runtime::AsyncStdConnectionProvider;
 
@@ -105,27 +100,20 @@ mod tests;
 mod time;
 
 pub use hickory_resolver::config;
-pub use hickory_resolver::error::ResolveError;
 pub use hickory_resolver::lookup;
 pub use hickory_resolver::lookup_ip;
 pub use hickory_resolver::proto;
+pub use hickory_resolver::ResolveError;
 
-/// An AsyncResolver used with async_std
-pub type AsyncStdResolver = AsyncResolver<AsyncStdConnectionProvider>;
+/// A Resolver used with async_std
+pub type AsyncStdResolver = Resolver<AsyncStdConnectionProvider>;
 
-/// Construct a new async-std based `AsyncResolver` with the provided configuration.
+/// Construct a new async-std based `Resolver` with the provided configuration.
 ///
 /// # Arguments
 ///
 /// * `config` - configuration, name_servers, etc. for the Resolver
 /// * `options` - basic lookup options for the resolver
-///
-/// # Returns
-///
-/// A tuple containing the new `AsyncResolver` and a future that drives the
-/// background task that runs resolutions for the `AsyncResolver`. See the
-/// documentation for `AsyncResolver` for more information on how to use
-/// the background future.
 pub async fn resolver(
     config: config::ResolverConfig,
     options: config::ResolverOpts,

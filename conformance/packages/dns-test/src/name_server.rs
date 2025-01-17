@@ -1,5 +1,5 @@
 use core::sync::atomic::{self, AtomicUsize};
-use std::net::Ipv4Addr;
+use std::{collections::HashMap, net::Ipv4Addr, thread, time::Duration};
 
 use crate::container::{Child, Container, Network};
 use crate::implementation::{Config, Role};
@@ -160,6 +160,7 @@ pub struct NameServer<State> {
     implementation: Implementation,
     state: State,
     zone_file: ZoneFile,
+    additional_zones: HashMap<FQDN, ZoneFile>,
 }
 
 impl NameServer<Stopped> {
@@ -198,6 +199,7 @@ impl NameServer<Stopped> {
             container,
             implementation: implementation.clone(),
             zone_file,
+            additional_zones: HashMap::new(),
             state: Stopped,
         })
     }
@@ -223,12 +225,24 @@ impl NameServer<Stopped> {
         self
     }
 
+    /// Copy a file to the name server's filesystem
+    pub fn cp(&self, path: &str, contents: &str) -> Result<()> {
+        self.container.cp(path, contents)?;
+        Ok(())
+    }
+
+    /// Adds an additional zone to the nameserver
+    pub fn add_zone(&mut self, name: FQDN, zone: ZoneFile) {
+        self.additional_zones.insert(name, zone);
+    }
+
     /// Freezes and signs the name server's zone file
     pub fn sign(self, settings: SignSettings) -> Result<NameServer<Signed>> {
         let Self {
             container,
             zone_file,
             implementation,
+            additional_zones,
             state: _,
         } = self;
 
@@ -239,6 +253,7 @@ impl NameServer<Stopped> {
             implementation,
             zone_file,
             state,
+            additional_zones,
         })
     }
 
@@ -248,28 +263,55 @@ impl NameServer<Stopped> {
             container,
             zone_file,
             implementation,
+            additional_zones,
             state: _,
         } = self;
 
         let config = Config::NameServer {
             origin: zone_file.origin(),
             use_dnssec: false,
+            additional_zones: additional_zones.clone(),
         };
 
-        container.cp(
-            implementation.conf_file_path(config.role()),
-            &implementation.format_config(config),
-        )?;
+        if let Some(conf_file_path) = implementation.conf_file_path(config.role()) {
+            container.cp(
+                conf_file_path,
+                &implementation.format_config(config.clone()),
+            )?;
+        }
 
         container.status_ok(&["mkdir", "-p", ZONES_DIR])?;
         container.cp(&zone_file_path(), &zone_file.to_string())?;
 
-        let child = container.spawn(&implementation.cmd_args(config.role()))?;
+        for (key, zone_file) in &additional_zones {
+            container.cp(&format!("{ZONES_DIR}/{key}zone"), &zone_file.to_string())?;
+        }
+
+        let mut child = container.spawn(&implementation.cmd_args(config.role()))?;
+
+        // For Dnslib, make sure the python interpreter is still running after two seconds
+        if let Implementation::Dnslib = implementation {
+            thread::sleep(Duration::from_secs(2));
+
+            match child.try_wait() {
+                Ok(None) => {} // the process is still running
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "unable to start dnslib server: {status:?}; logs: {:?}",
+                        container
+                            .stdout(&["cat", &implementation.stderr_logfile(Role::NameServer)]),
+                    )
+                    .into())
+                }
+                Err(e) => println!("unable to determine if dnslib started: {e}"),
+            }
+        }
 
         Ok(NameServer {
             container,
             implementation,
             zone_file,
+            additional_zones,
             state: Running {
                 _child: child,
                 trust_anchor: None,
@@ -281,12 +323,17 @@ impl NameServer<Stopped> {
 const ZONES_DIR: &str = "/etc/zones";
 const ZONE_FILENAME: &str = "main.zone";
 const ZSK_PRIVATE_FILENAME: &str = "zsk.key";
+const ZSK_PKCS8_FILENAME: &str = "zsk.pk8";
 
 fn zone_file_path() -> String {
     format!("{ZONES_DIR}/{ZONE_FILENAME}")
 }
 fn zsk_private_path() -> String {
     format!("{ZONES_DIR}/{ZSK_PRIVATE_FILENAME}")
+}
+
+fn zsk_pkcs8_path() -> String {
+    format!("{ZONES_DIR}/{ZSK_PKCS8_FILENAME}")
 }
 
 fn ns_count() -> usize {
@@ -303,18 +350,22 @@ impl NameServer<Signed> {
             container,
             zone_file,
             implementation,
+            additional_zones,
             state,
         } = self;
 
         let config = Config::NameServer {
             origin: zone_file.origin(),
             use_dnssec: state.use_dnssec,
+            additional_zones: additional_zones.clone(),
         };
 
-        container.cp(
-            implementation.conf_file_path(config.role()),
-            &implementation.format_config(config),
-        )?;
+        if let Some(conf_file_path) = implementation.conf_file_path(config.role()) {
+            container.cp(
+                conf_file_path,
+                &implementation.format_config(config.clone()),
+            )?;
+        }
 
         if implementation.is_hickory() && state.use_dnssec {
             // FIXME: Hickory does not support pre-signed zonefiles. We copy the unsigned
@@ -325,6 +376,20 @@ impl NameServer<Signed> {
             // don't compare signatures in any of the conformance tests.
             let zsk = container.stdout(&["openssl", "genpkey", "-algorithm", "RSA"])?;
             container.cp(&zsk_private_path(), &zsk)?;
+            container.status_ok(&[
+                "openssl",
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-inform",
+                "pem",
+                "-in",
+                &zsk_private_path(),
+                "-outform",
+                "der",
+                "-out",
+                &zsk_pkcs8_path(),
+            ])?;
         } else {
             container.cp(&zone_file_path(), &state.signed.to_string())?;
         }
@@ -335,6 +400,7 @@ impl NameServer<Signed> {
             container,
             implementation,
             zone_file,
+            additional_zones,
             state: Running {
                 _child: child,
                 trust_anchor: Some(state.trust_anchor()),
@@ -380,7 +446,11 @@ impl NameServer<Running> {
     /// Returns the logs collected so far
     pub fn logs(&self) -> Result<String> {
         if self.implementation.is_hickory() {
-            self.stdout()
+            Ok(format!(
+                "STDOUT:\n{}\nSTDERR:\n{}",
+                self.stdout()?,
+                self.stderr()?,
+            ))
         } else {
             self.stderr()
         }
@@ -404,6 +474,10 @@ impl<S> NameServer<S> {
 
     pub fn container_name(&self) -> &str {
         self.container.name()
+    }
+
+    pub fn container(&self) -> &Container {
+        &self.container
     }
 
     pub fn ipv4_addr(&self) -> Ipv4Addr {
@@ -504,6 +578,8 @@ fn expand_zone(zone: &FQDN) -> String {
     } else if zone.num_labels() == 1 {
         if *zone == FQDN::TEST_TLD {
             FQDN::TEST_DOMAIN.as_str().to_string()
+        } else if *zone == FQDN::COM_TLD {
+            "nameservers.com.".to_string()
         } else {
             unimplemented!()
         }
@@ -518,7 +594,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::client::{Client, DigSettings};
-    use crate::record::RecordType;
+    use crate::record::{RecordType, A, NS};
 
     use super::*;
 
@@ -651,6 +727,82 @@ mod tests {
             }
         }
         assert!(found);
+
+        Ok(())
+    }
+
+    #[test]
+    fn bind_multizone_works() -> Result<()> {
+        multizone_test(&Implementation::Bind)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hickory_multizone_works() -> Result<()> {
+        multizone_test(&Implementation::hickory())?;
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_multizone_works() -> Result<()> {
+        multizone_test(&Implementation::Unbound)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn multizone_test(implementation: &Implementation) -> Result<()> {
+        let network = Network::new()?;
+        let mut ns = NameServer::new(implementation, FQDN::ROOT, &network)?;
+        let mut zone_file = ZoneFile::new(SOA {
+            zone: FQDN("domain.testing.")?,
+            ttl: 86400,
+            nameserver: FQDN("ns.domain.testing.")?,
+            admin: FQDN("admin.domain.testing.")?,
+            settings: SoaSettings::default(),
+        });
+        zone_file.add(Record::NS(NS {
+            zone: FQDN("domain.testing.")?,
+            ttl: 86400,
+            nameserver: FQDN("ns.domain.testing.")?,
+        }));
+        zone_file.add(Record::A(A {
+            fqdn: FQDN("ns.domain.testing.")?,
+            ipv4_addr: Ipv4Addr::new(192, 0, 2, 1),
+            ttl: 86400,
+        }));
+
+        zone_file.add(Record::A(A {
+            fqdn: FQDN("host.domain.testing.")?,
+            ipv4_addr: Ipv4Addr::new(192, 0, 2, 1),
+            ttl: 86400,
+        }));
+
+        ns.add_zone(FQDN("domain.testing.")?, zone_file);
+
+        let ns = ns.start()?;
+        thread::sleep(Duration::from_secs(2));
+
+        let client = Client::new(&network)?;
+        let dig_settings = DigSettings::default();
+        let res = client.dig(
+            dig_settings,
+            ns.ipv4_addr(),
+            RecordType::A,
+            &FQDN("host.domain.testing.")?,
+        );
+
+        if let Ok(res) = &res {
+            assert!(res.status.is_noerror());
+            assert_eq!(res.answer.len(), 1);
+            if let Record::A(rec) = res.answer.first().unwrap() {
+                assert_eq!(rec.fqdn, FQDN("host.domain.testing.")?);
+                assert_eq!(rec.ipv4_addr, Ipv4Addr::new(192, 0, 2, 1));
+            } else {
+                panic!("error");
+            }
+        } else {
+            panic!("error");
+        }
 
         Ok(())
     }

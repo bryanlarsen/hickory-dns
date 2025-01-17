@@ -7,8 +7,8 @@
 
 //! record data enum variants
 
-#[cfg(feature = "dnssec")]
-use crate::rr::dnssec::rdata::DNSSECRData;
+#[cfg(feature = "dnssec-ring")]
+use crate::dnssec::rdata::DNSSECRData;
 use crate::{
     rr::{
         rdata::{ANAME, CNAME, HTTPS, NS, PTR},
@@ -69,6 +69,7 @@ impl RDataParser for RData {
             RecordType::ANY => return Err(ParseError::from("parsing ANY doesn't make sense")),
             RecordType::AXFR => return Err(ParseError::from("parsing AXFR doesn't make sense")),
             RecordType::CAA => caa::parse(tokens).map(Self::CAA)?,
+            RecordType::CERT => Self::CERT(cert::parse(tokens)?),
             RecordType::CNAME => Self::CNAME(CNAME(name::parse(tokens, origin)?)),
             RecordType::CSYNC => csync::parse(tokens).map(Self::CSYNC)?,
             RecordType::HINFO => Self::HINFO(hinfo::parse(tokens)?),
@@ -95,9 +96,9 @@ impl RDataParser for RData {
                 return Err(ParseError::from("CDNSKEY should be dynamically generated"))
             }
             RecordType::KEY => return Err(ParseError::from("KEY should be dynamically generated")),
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             RecordType::DS => Self::DNSSEC(DNSSECRData::DS(ds::parse(tokens)?)),
-            #[cfg(not(feature = "dnssec"))]
+            #[cfg(not(feature = "dnssec-ring"))]
             RecordType::DS => return Err(ParseError::from("DS should be dynamically generated")),
             RecordType::CDS => return Err(ParseError::from("CDS should be dynamically generated")),
             RecordType::NSEC => {
@@ -132,8 +133,8 @@ mod tests {
     #![allow(clippy::dbg_macro, clippy::print_stdout)]
 
     use super::*;
-    #[cfg(feature = "dnssec")]
-    use crate::rr::dnssec::rdata::DS;
+    #[cfg(feature = "dnssec-ring")]
+    use crate::dnssec::rdata::DS;
     use crate::rr::domain::Name;
     use crate::rr::rdata::*;
     use std::str::FromStr;
@@ -185,7 +186,7 @@ mod tests {
 
         assert_eq!(
             record,
-            RData::NS(NS(Name::from_str("ns.example.com.").unwrap()))
+            RData::NS(NS(Name::from_str("ns.example.com").unwrap()))
         );
     }
 
@@ -227,7 +228,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     #[test]
     #[allow(deprecated)]
     fn test_ds() {
@@ -250,8 +251,8 @@ mod tests {
             record,
             RData::DNSSEC(DNSSECRData::DS(DS::new(
                 60485,
-                crate::rr::dnssec::Algorithm::RSASHA1,
-                crate::rr::dnssec::DigestType::SHA1,
+                crate::dnssec::Algorithm::RSASHA1,
+                crate::dnssec::DigestType::SHA1,
                 vec![
                     0x2B, 0xB1, 0x83, 0xAF, 0x5F, 0x22, 0x58, 0x81, 0x79, 0xA5, 0x3B, 0x0A, 0x98,
                     0x63, 0x1F, 0xAD, 0x1A, 0x29, 0x21, 0x18

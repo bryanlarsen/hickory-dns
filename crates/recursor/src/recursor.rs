@@ -5,22 +5,32 @@
 // https://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::time::Instant;
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{atomic::AtomicU8, Arc},
+    time::Instant,
+};
 
 use ipnet::IpNet;
-
-#[cfg(feature = "dnssec")]
-use crate::{
-    proto::xfer::{DnsHandle as _, DnsRequestOptions, DnssecDnsHandle, FirstAnswer as _},
-    resolver::dns_lru::DnsLru,
-    resolver::error::ResolveErrorKind,
-};
 
 use crate::{
     proto::op::Query,
     recursor_dns_handle::RecursorDnsHandle,
-    resolver::{config::NameServerConfigGroup, error::ResolveError, lookup::Lookup},
+    resolver::{config::NameServerConfigGroup, dns_lru::TtlConfig, lookup::Lookup},
     DnssecPolicy, Error,
+};
+#[cfg(feature = "dnssec-ring")]
+use crate::{
+    proto::{
+        dnssec::{DnssecDnsHandle, TrustAnchor},
+        op::ResponseCode,
+        rr::{resource::RecordRef, Record, RecordType},
+        xfer::{DnsHandle as _, DnsRequestOptions, FirstAnswer as _},
+        ProtoError,
+    },
+    resolver::dns_lru::DnsLru,
+    ErrorKind,
 };
 
 /// A `Recursor` builder
@@ -28,32 +38,76 @@ use crate::{
 pub struct RecursorBuilder {
     ns_cache_size: usize,
     record_cache_size: usize,
+    /// This controls how many nested lookups will be attempted to resolve a CNAME chain. Setting it
+    /// to None will disable the recursion limit check, and is not recommended.
+    recursion_limit: Option<u8>,
+    /// This controls how many nested lookups will be attempted when trying to build an NS pool.
+    /// Setting it to None will disable the recursion limit check, and is not recommended.
+    ns_recursion_limit: Option<u8>,
     dnssec_policy: DnssecPolicy,
-    do_not_query: Vec<IpNet>,
+    allow_servers: Vec<IpNet>,
+    deny_servers: Vec<IpNet>,
+    avoid_local_udp_ports: HashSet<u16>,
+    ttl_config: TtlConfig,
 }
 
 impl RecursorBuilder {
     /// Sets the size of the list of cached name servers
-    pub fn ns_cache_size(&mut self, size: usize) -> &mut Self {
+    pub fn ns_cache_size(mut self, size: usize) -> Self {
         self.ns_cache_size = size;
         self
     }
 
     /// Sets the size of the list of cached records
-    pub fn record_cache_size(&mut self, size: usize) -> &mut Self {
+    pub fn record_cache_size(mut self, size: usize) -> Self {
         self.record_cache_size = size;
         self
     }
 
+    /// Sets the maximum recursion depth for queries; set to None for unlimited
+    /// recursion.
+    pub fn recursion_limit(mut self, limit: Option<u8>) -> Self {
+        self.recursion_limit = limit;
+        self
+    }
+
+    /// Sets the maximum recursion depth for building NS pools; set to None for unlimited
+    /// recursion.
+    pub fn ns_recursion_limit(mut self, limit: Option<u8>) -> Self {
+        self.ns_recursion_limit = limit;
+        self
+    }
+
     /// Sets the DNSSEC policy
-    pub fn dnssec_policy(&mut self, dnssec_policy: DnssecPolicy) -> &mut Self {
+    pub fn dnssec_policy(mut self, dnssec_policy: DnssecPolicy) -> Self {
         self.dnssec_policy = dnssec_policy;
         self
     }
 
     /// Add networks that should not be queried during recursive resolution
-    pub fn do_not_query(&mut self, networks: &[IpNet]) -> &mut Self {
-        self.do_not_query.extend(networks.iter().copied());
+    pub fn nameserver_filter<'a>(
+        mut self,
+        allow: impl Iterator<Item = &'a IpNet>,
+        deny: impl Iterator<Item = &'a IpNet>,
+    ) -> Self {
+        for addr in RECOMMENDED_SERVER_FILTERS {
+            self.deny_servers.push(addr);
+        }
+
+        self.allow_servers.extend(allow);
+        self.deny_servers.extend(deny);
+        self
+    }
+
+    /// Sets local UDP ports that should be avoided when making outgoing queries
+    pub fn avoid_local_udp_ports(mut self, ports: HashSet<u16>) -> Self {
+        self.avoid_local_udp_ports = ports;
+        self
+    }
+
+    /// Sets the minimum and maximum TTL values for cached responses
+    pub fn ttl_config(mut self, ttl_config: TtlConfig) -> Self {
+        self.ttl_config = ttl_config;
         self
     }
 
@@ -62,14 +116,8 @@ impl RecursorBuilder {
     /// # Panics
     ///
     /// This will panic if the roots are empty.
-    pub fn build(&self, roots: impl Into<NameServerConfigGroup>) -> Result<Recursor, ResolveError> {
-        Recursor::build(
-            roots,
-            self.ns_cache_size,
-            self.record_cache_size,
-            self.dnssec_policy.clone(),
-            self.do_not_query.clone(),
-        )
+    pub fn build(self, roots: impl Into<NameServerConfigGroup>) -> Result<Recursor, Error> {
+        Recursor::build(roots, self)
     }
 }
 
@@ -92,45 +140,56 @@ impl Recursor {
         !matches!(self.mode, RecursorMode::NonValidating { .. })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         roots: impl Into<NameServerConfigGroup>,
-        ns_cache_size: usize,
-        record_cache_size: usize,
-        dnssec_policy: DnssecPolicy,
-        do_not_query: Vec<IpNet>,
-    ) -> Result<Self, ResolveError> {
+        builder: RecursorBuilder,
+    ) -> Result<Self, Error> {
+        let RecursorBuilder {
+            ns_cache_size,
+            record_cache_size,
+            recursion_limit,
+            ns_recursion_limit,
+            dnssec_policy,
+            allow_servers,
+            deny_servers,
+            avoid_local_udp_ports,
+            ttl_config,
+        } = builder;
+
         let handle = RecursorDnsHandle::new(
             roots,
             ns_cache_size,
             record_cache_size,
+            recursion_limit,
+            ns_recursion_limit,
             dnssec_policy.is_security_aware(),
-            do_not_query,
-        )?;
+            allow_servers,
+            deny_servers,
+            Arc::new(avoid_local_udp_ports),
+            ttl_config,
+        );
 
         let mode = match dnssec_policy {
             DnssecPolicy::SecurityUnaware => RecursorMode::NonValidating { handle },
 
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             DnssecPolicy::ValidationDisabled => RecursorMode::NonValidating { handle },
 
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             DnssecPolicy::ValidateWithStaticKey { trust_anchor } => {
                 let record_cache = handle.record_cache().clone();
-                let handle = if let Some(trust_anchor) = trust_anchor {
-                    if trust_anchor.is_empty() {
-                        return Err(ResolveError::from(ResolveErrorKind::Message(
-                            "trust anchor must not be empty",
-                        )));
+                let trust_anchor = match trust_anchor {
+                    Some(anchor) if anchor.is_empty() => {
+                        return Err(Error::from("trust anchor must not be empty"));
                     }
-
-                    DnssecDnsHandle::with_trust_anchor(handle, trust_anchor.clone())
-                } else {
-                    DnssecDnsHandle::new(handle)
+                    Some(anchor) => anchor,
+                    None => Arc::new(TrustAnchor::default()),
                 };
 
                 RecursorMode::Validating {
                     record_cache,
-                    handle,
+                    handle: DnssecDnsHandle::with_trust_anchor(handle, trust_anchor),
                 }
             }
         };
@@ -312,11 +371,17 @@ impl Recursor {
         match &self.mode {
             RecursorMode::NonValidating { handle } => {
                 handle
-                    .resolve(query, request_time, query_has_dnssec_ok)
+                    .resolve(
+                        query,
+                        request_time,
+                        query_has_dnssec_ok,
+                        0,
+                        Arc::new(AtomicU8::new(0)),
+                    )
                     .await
             }
 
-            #[cfg(feature = "dnssec")]
+            #[cfg(feature = "dnssec-ring")]
             RecursorMode::Validating {
                 handle,
                 record_cache,
@@ -344,20 +409,67 @@ impl Recursor {
                 options.edns_set_dnssec_ok = true;
 
                 let response = handle.lookup(query.clone(), options).first_answer().await?;
-                // do not perform is_subzone filtering as it already happened in `handle.lookup`
-                let no_subzone_filtering = None;
-                let lookup = super::cache_response(
-                    response,
-                    no_subzone_filtering,
-                    record_cache,
-                    query.clone(),
-                    request_time,
-                )?;
-                Ok(super::maybe_strip_dnssec_records(
-                    query_has_dnssec_ok,
-                    lookup,
-                    query,
-                ))
+
+                // Return NXDomain and NoData responses in error form
+                // These need to bypass the cache lookup (and casting to a Lookup object in general)
+                // to preserve SOA and DNSSEC records, and to keep those records in the authorities
+                // section of the response.
+                if response.response_code() == ResponseCode::NXDomain {
+                    let Err(proto_err) = ProtoError::from_response(response, true) else {
+                        return Err(Error::from(
+                            "unable to build ProtoError from response {response:?}",
+                        ));
+                    };
+
+                    Err(Error {
+                        kind: Box::new(ErrorKind::Proto(proto_err)),
+                        #[cfg(feature = "backtrace")]
+                        backtrack: None,
+                    })
+                } else if response.answers().is_empty()
+                    && !response.name_servers().is_empty()
+                    && response.response_code() == ResponseCode::NoError
+                {
+                    let authorities = response
+                        .name_servers()
+                        .iter()
+                        .filter_map(|x| match x.record_type() {
+                            RecordType::SOA => None,
+                            _ => Some(x.clone()),
+                        })
+                        .collect::<Arc<[Record]>>();
+
+                    let soa = response.soa().as_ref().map(RecordRef::to_owned);
+
+                    Err(Error {
+                        kind: Box::new(ErrorKind::Proto(ProtoError::nx_error(
+                            Box::new(query),
+                            soa.map(Box::new),
+                            None,
+                            None,
+                            ResponseCode::NoError,
+                            true,
+                            Some(authorities),
+                        ))),
+                        #[cfg(feature = "backtrace")]
+                        backtrack: None,
+                    })
+                } else {
+                    // do not perform is_subzone filtering as it already happened in `handle.lookup`
+                    let no_subzone_filtering = None;
+                    let lookup = super::cache_response(
+                        response,
+                        no_subzone_filtering,
+                        record_cache,
+                        query.clone(),
+                        request_time,
+                    )?;
+                    Ok(super::maybe_strip_dnssec_records(
+                        query_has_dnssec_ok,
+                        lookup,
+                        query,
+                    ))
+                }
             }
         }
     }
@@ -368,8 +480,16 @@ impl Default for RecursorBuilder {
         Self {
             ns_cache_size: 1_024,
             record_cache_size: 1_048_576,
+            // This default is based on CNAME recursion failures of long (> 8 records) CNAME chains
+            // that users of Unbound encountered (see https://github.com/NLnetLabs/unbound/issues/438)
+            // with a small safety margin added.
+            recursion_limit: Some(12),
+            ns_recursion_limit: Some(16),
             dnssec_policy: DnssecPolicy::SecurityUnaware,
-            do_not_query: vec![],
+            allow_servers: vec![],
+            deny_servers: vec![],
+            avoid_local_udp_ports: HashSet::new(),
+            ttl_config: TtlConfig::default(),
         }
     }
 }
@@ -379,7 +499,7 @@ enum RecursorMode {
         handle: RecursorDnsHandle,
     },
 
-    #[cfg(feature = "dnssec")]
+    #[cfg(feature = "dnssec-ring")]
     Validating {
         handle: DnssecDnsHandle<RecursorDnsHandle>,
         // this is a handle to the record cache in `RecursorDnsHandle`; not a whole separate cache
@@ -387,38 +507,27 @@ enum RecursorMode {
     },
 }
 
-#[cfg(test)]
-#[tokio::test]
-async fn not_fully_qualified_domain_name_in_query() -> Result<(), Error> {
-    use crate::{proto::rr::RecordType, resolver::Name};
-
-    let recursor = Recursor::builder().build(NameServerConfigGroup::cloudflare())?;
-    let name = Name::from_ascii("example.com")?;
-    assert!(!name.is_fqdn());
-    let query = Query::query(name, RecordType::A);
-    let res = recursor
-        .resolve(query, Instant::now(), false)
-        .await
-        .unwrap_err();
-    assert!(res.to_string().contains("fully qualified"));
-
-    Ok(())
-}
-
-#[cfg(feature = "dnssec")]
+#[cfg(feature = "dnssec-ring")]
 mod for_dnssec {
-    use std::time::Instant;
+    use std::{
+        sync::{atomic::AtomicU8, Arc},
+        time::Instant,
+    };
 
     use futures_util::{
         future,
         stream::{self, BoxStream},
-        StreamExt as _, TryFutureExt as _,
+        StreamExt as _,
     };
 
     use crate::proto::{
-        error::ProtoError, op::Message, op::OpCode, xfer::DnsHandle, xfer::DnsResponse,
+        op::{Message, OpCode},
+        xfer::DnsHandle,
+        xfer::DnsResponse,
+        ProtoError,
     };
     use crate::recursor_dns_handle::RecursorDnsHandle;
+    use crate::ErrorKind;
 
     impl DnsHandle for RecursorDnsHandle {
         type Response = BoxStream<'static, Result<DnsResponse, ProtoError>>;
@@ -447,22 +556,81 @@ mod for_dnssec {
             stream::once(async move {
                 // request the DNSSEC records; we'll strip them if not needed on the caller side
                 let do_bit = true;
-                this.resolve(query, Instant::now(), do_bit)
-                    .map_ok(|lookup| {
-                        // `DnssecDnsHandle` will only look at the answer section of the message so
-                        // we can put "stubs" in the other fields
-                        let mut msg = Message::new();
 
-                        // XXX this effectively merges the original nameservers and additional
-                        // sections into the answers section
-                        msg.add_answers(lookup.records().iter().cloned());
+                let future =
+                    this.resolve(query, Instant::now(), do_bit, 0, Arc::new(AtomicU8::new(0)));
+                let lookup = match future.await {
+                    Ok(lookup) => lookup,
+                    Err(e) => {
+                        return Err(match e.kind() {
+                            // Translate back into a ProtoError::NoRecordsFound
+                            ErrorKind::Forward(_fwd) => e.into(),
+                            _ => ProtoError::from(e.to_string()),
+                        });
+                    }
+                };
 
-                        DnsResponse::new(msg, vec![])
-                    })
-                    .map_err(|e| ProtoError::from(e.to_string()))
-                    .await
+                // `DnssecDnsHandle` will only look at the answer section of the message so
+                // we can put "stubs" in the other fields
+                let mut msg = Message::new();
+
+                // XXX this effectively merges the original nameservers and additional
+                // sections into the answers section
+                msg.add_answers(lookup.records().iter().cloned());
+
+                DnsResponse::from_message(msg)
             })
             .boxed()
         }
+    }
+}
+
+const RECOMMENDED_SERVER_FILTERS: [IpNet; 22] = [
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8), // Loopback range
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8),       // Unspecified range
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::BROADCAST), 32),        // Directed Broadcast
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),  // RFC 1918 space
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12), // RFC 1918 space
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16), // RFC 1918 space
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10), // CG NAT
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16), // Link-local space
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24), // IETF Reserved
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24), // TEST-NET-1
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24), // TEST-NET-2
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24), // TEST-NET-3
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4), // Class E Reserved
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::LOCALHOST), 128),       // v6 loopback
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128),     // v6 unspecified
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0)), 64), // v6 discard prefix
+    IpNet::new_assert(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0)),
+        32,
+    ), // v6 documentation prefix
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0)), 20), // v6 documentation prefix
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0)), 16), // v6 segment routing prefix
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7), // v6 private address,
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 64), // v6 link local
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8), // v6 multicast
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn not_fully_qualified_domain_name_in_query() -> Result<(), Error> {
+        use crate::{proto::rr::RecordType, resolver::Name};
+
+        let recursor = Recursor::builder().build(NameServerConfigGroup::cloudflare())?;
+        let name = Name::from_ascii("example.com")?;
+        assert!(!name.is_fqdn());
+        let query = Query::query(name, RecordType::A);
+        let res = recursor
+            .resolve(query, Instant::now(), false)
+            .await
+            .unwrap_err();
+        assert!(res.to_string().contains("fully qualified"));
+
+        Ok(())
     }
 }

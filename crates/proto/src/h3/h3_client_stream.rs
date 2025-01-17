@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use std::fmt::{self, Display};
-use std::future::{self, Future};
+use std::future::{poll_fn, Future};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -19,15 +19,14 @@ use futures_util::stream::Stream;
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
 use http::header::{self, CONTENT_LENGTH};
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint, EndpointConfig, TransportConfig};
-use rustls::ClientConfig as TlsClientConfig;
+use quinn::{Endpoint, EndpointConfig, TransportConfig};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::error::ProtoError;
 use crate::http::Version;
-use crate::op::Message;
+use crate::quic::connect_quic;
+use crate::rustls::client_config;
 use crate::udp::UdpSocket;
 use crate::xfer::{DnsRequest, DnsRequestSender, DnsResponse, DnsResponseStream};
 
@@ -40,6 +39,7 @@ pub struct H3ClientStream {
     // Corresponds to the dns-name of the HTTP/3 server
     name_server_name: Arc<str>,
     name_server: SocketAddr,
+    query_path: Arc<str>,
     send_request: SendRequest<OpenStreams, Bytes>,
     shutdown_tx: mpsc::Sender<()>,
     is_shutdown: bool,
@@ -65,10 +65,15 @@ impl H3ClientStream {
         mut h3: SendRequest<OpenStreams, Bytes>,
         message: Bytes,
         name_server_name: Arc<str>,
+        query_path: Arc<str>,
     ) -> Result<DnsResponse, ProtoError> {
         // build up the http request
-        let request =
-            crate::http::request::new(Version::Http3, &name_server_name, message.remaining());
+        let request = crate::http::request::new(
+            Version::Http3,
+            &name_server_name,
+            &query_path,
+            message.remaining(),
+        );
 
         let request =
             request.map_err(|err| ProtoError::from(format!("bad http request: {err}")))?;
@@ -179,8 +184,7 @@ impl H3ClientStream {
         };
 
         // and finally convert the bytes into a DNS message
-        let message = Message::from_vec(&response_bytes)?;
-        Ok(DnsResponse::new(message, response_bytes.to_vec()))
+        DnsResponse::from_buffer(response_bytes.to_vec())
     }
 }
 
@@ -232,15 +236,15 @@ impl DnsRequestSender for H3ClientStream {
     ///    (Unsupported Media Type) upon receiving a media type it is unable to
     ///    process.
     /// ```
-    fn send_message(&mut self, mut message: DnsRequest) -> DnsResponseStream {
+    fn send_message(&mut self, mut request: DnsRequest) -> DnsResponseStream {
         if self.is_shutdown {
             panic!("can not send messages after stream is shutdown")
         }
 
         // per the RFC, a zero id allows for the HTTP packet to be cached better
-        message.set_id(0);
+        request.set_id(0);
 
-        let bytes = match message.to_vec() {
+        let bytes = match request.to_vec() {
             Ok(bytes) => bytes,
             Err(err) => return err.into(),
         };
@@ -249,6 +253,7 @@ impl DnsRequestSender for H3ClientStream {
             self.send_request.clone(),
             Bytes::from(bytes),
             Arc::clone(&self.name_server_name),
+            Arc::clone(&self.query_path),
         ))
         .into()
     }
@@ -284,14 +289,14 @@ impl Stream for H3ClientStream {
 /// A H3 connection builder for DNS-over-HTTP/3
 #[derive(Clone)]
 pub struct H3ClientStreamBuilder {
-    crypto_config: TlsClientConfig,
+    crypto_config: rustls::ClientConfig,
     transport_config: Arc<TransportConfig>,
     bind_addr: Option<SocketAddr>,
 }
 
 impl H3ClientStreamBuilder {
     /// Constructs a new H3ClientStreamBuilder with the associated ClientConfig
-    pub fn crypto_config(&mut self, crypto_config: TlsClientConfig) -> &mut Self {
+    pub fn crypto_config(&mut self, crypto_config: rustls::ClientConfig) -> &mut Self {
         self.crypto_config = crypto_config;
         self
     }
@@ -306,9 +311,14 @@ impl H3ClientStreamBuilder {
     /// # Arguments
     ///
     /// * `name_server` - IP and Port for the remote DNS resolver
-    /// * `dns_name` - The DNS name, Subject Public Key Info (SPKI) name, as associated to a certificate
-    pub fn build(self, name_server: SocketAddr, dns_name: String) -> H3ClientConnect {
-        H3ClientConnect(Box::pin(self.connect(name_server, dns_name)) as _)
+    /// * `dns_name` - The DNS name associated with a certificate
+    pub fn build(
+        self,
+        name_server: SocketAddr,
+        dns_name: String,
+        query_path: String,
+    ) -> H3ClientConnect {
+        H3ClientConnect(Box::pin(self.connect(name_server, dns_name, query_path)) as _)
     }
 
     /// Creates a new H3Stream with existing connection
@@ -317,8 +327,14 @@ impl H3ClientStreamBuilder {
         socket: Arc<dyn quinn::AsyncUdpSocket>,
         name_server: SocketAddr,
         dns_name: String,
+        query_path: String,
     ) -> H3ClientConnect {
-        H3ClientConnect(Box::pin(self.connect_with_future(socket, name_server, dns_name)) as _)
+        H3ClientConnect(Box::pin(self.connect_with_future(
+            socket,
+            name_server,
+            dns_name,
+            query_path,
+        )) as _)
     }
 
     async fn connect_with_future(
@@ -326,6 +342,7 @@ impl H3ClientStreamBuilder {
         socket: Arc<dyn quinn::AsyncUdpSocket>,
         name_server: SocketAddr,
         server_name: String,
+        query_path: String,
     ) -> Result<H3ClientStream, ProtoError> {
         let endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
@@ -333,13 +350,15 @@ impl H3ClientStreamBuilder {
             socket,
             Arc::new(quinn::TokioRuntime),
         )?;
-        self.connect_inner(endpoint, name_server, server_name).await
+        self.connect_inner(endpoint, name_server, server_name, query_path)
+            .await
     }
 
     async fn connect(
         self,
         name_server: SocketAddr,
         dns_name: String,
+        query_path: String,
     ) -> Result<H3ClientStream, ProtoError> {
         let connect = if let Some(bind_addr) = self.bind_addr {
             <tokio::net::UdpSocket as UdpSocket>::connect_with_bind(name_server, bind_addr)
@@ -355,39 +374,26 @@ impl H3ClientStreamBuilder {
             socket,
             Arc::new(quinn::TokioRuntime),
         )?;
-        self.connect_inner(endpoint, name_server, dns_name).await
+        self.connect_inner(endpoint, name_server, dns_name, query_path)
+            .await
     }
 
     async fn connect_inner(
         self,
-        mut endpoint: Endpoint,
+        endpoint: Endpoint,
         name_server: SocketAddr,
         dns_name: String,
+        query_path: String,
     ) -> Result<H3ClientStream, ProtoError> {
-        let mut crypto_config = self.crypto_config;
-        // ensure the ALPN protocol is set correctly
-        if crypto_config.alpn_protocols.is_empty() {
-            crypto_config.alpn_protocols = vec![ALPN_H3.to_vec()];
-        }
-        let early_data_enabled = crypto_config.enable_early_data;
-
-        let mut client_config =
-            ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto_config)?));
-        client_config.transport_config(self.transport_config.clone());
-
-        endpoint.set_default_client_config(client_config);
-
-        let connecting = endpoint.connect(name_server, &dns_name)?;
-        // TODO: for Client/Dynamic update, don't use RTT, for queries, do use it.
-
-        let quic_connection = if early_data_enabled {
-            match connecting.into_0rtt() {
-                Ok((new_connection, _)) => new_connection,
-                Err(connecting) => connecting.await?,
-            }
-        } else {
-            connecting.await?
-        };
+        let quic_connection = connect_quic(
+            name_server,
+            &dns_name,
+            ALPN_H3,
+            self.crypto_config,
+            self.transport_config,
+            endpoint,
+        )
+        .await?;
 
         let h3_connection = h3_quinn::Connection::new(quic_connection);
         let (mut driver, send_request) = h3::client::new(h3_connection)
@@ -400,7 +406,7 @@ impl H3ClientStreamBuilder {
         debug!("h3 connection is ready: {}", name_server);
         tokio::spawn(async move {
             tokio::select! {
-                res = future::poll_fn(|cx| driver.poll_close(cx)) => {
+                res = poll_fn(|cx| driver.poll_close(cx)) => {
                     res.map_err(|e| warn!("h3 connection failed: {e}"))
                 }
                 _ = shutdown_rx.recv() => {
@@ -413,6 +419,7 @@ impl H3ClientStreamBuilder {
         Ok(H3ClientStream {
             name_server_name: Arc::from(dns_name),
             name_server,
+            query_path: Arc::from(query_path),
             send_request,
             shutdown_tx,
             is_shutdown: false,
@@ -423,7 +430,7 @@ impl H3ClientStreamBuilder {
 impl Default for H3ClientStreamBuilder {
     fn default() -> Self {
         Self {
-            crypto_config: super::client_config_tls13().unwrap(),
+            crypto_config: client_config().unwrap(),
             transport_config: Arc::new(super::transport()),
             bind_addr: None,
         }
@@ -460,10 +467,11 @@ mod tests {
     use std::str::FromStr;
 
     use rustls::KeyLogFile;
+    use test_support::subscribe;
     use tokio::runtime::Runtime;
     use tokio::task::JoinSet;
 
-    use crate::op::{Message, Query, ResponseCode};
+    use crate::op::{Edns, Message, Query, ResponseCode};
     use crate::rr::rdata::{A, AAAA};
     use crate::rr::{Name, RecordType};
     use crate::xfer::{DnsRequestOptions, FirstAnswer};
@@ -472,21 +480,26 @@ mod tests {
 
     #[test]
     fn test_h3_google() {
-        //env_logger::try_init().ok();
+        subscribe();
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::new();
         let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
+        request.set_recursion_desired(true);
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(1232);
+        *request.extensions_mut() = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
-        let mut client_config = super::super::client_config_tls13().unwrap();
+        let mut client_config = client_config().unwrap();
         client_config.key_log = Arc::new(KeyLogFile::new());
 
         let mut h3_builder = H3ClientStream::builder();
         h3_builder.crypto_config(client_config);
-        let connect = h3_builder.build(google, "dns.google".to_string());
+        let connect = h3_builder.build(google, "dns.google".to_string(), "/dns-query".to_string());
 
         // tokio runtime stuff...
         let runtime = Runtime::new().expect("could not start runtime");
@@ -496,10 +509,10 @@ mod tests {
             .block_on(h3.send_message(request).first_answer())
             .expect("send_message failed");
 
-        let record = &response.answers()[0];
-        let addr = record.data().as_a().expect("Expected A record");
-
-        assert_eq!(addr, &A::new(93, 184, 215, 14));
+        assert!(response
+            .answers()
+            .iter()
+            .any(|record| record.data().as_a().is_some()));
 
         //
         // assert that the connection works for a second query
@@ -534,21 +547,26 @@ mod tests {
 
     #[test]
     fn test_h3_google_with_pure_ip_address_server() {
-        //env_logger::try_init().ok();
+        subscribe();
 
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
         let mut request = Message::new();
         let query = Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A);
         request.add_query(query);
+        request.set_recursion_desired(true);
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(1232);
+        *request.extensions_mut() = Some(edns);
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
-        let mut client_config = super::super::client_config_tls13().unwrap();
+        let mut client_config = client_config().unwrap();
         client_config.key_log = Arc::new(KeyLogFile::new());
 
         let mut h3_builder = H3ClientStream::builder();
         h3_builder.crypto_config(client_config);
-        let connect = h3_builder.build(google, google.ip().to_string());
+        let connect = h3_builder.build(google, google.ip().to_string(), "/dns-query".to_string());
 
         // tokio runtime stuff...
         let runtime = Runtime::new().expect("could not start runtime");
@@ -558,10 +576,10 @@ mod tests {
             .block_on(h3.send_message(request).first_answer())
             .expect("send_message failed");
 
-        let record = &response.answers()[0];
-        let addr = record.data().as_a().expect("Expected A record");
-
-        assert_eq!(addr, &A::new(93, 184, 215, 14));
+        assert!(response
+            .answers()
+            .iter()
+            .any(|record| record.data().as_a().is_some()));
 
         //
         // assert that the connection works for a second query
@@ -596,9 +614,9 @@ mod tests {
 
     /// Currently fails, see <https://github.com/hyperium/h3/issues/206>.
     #[test]
-    #[ignore] // cloudflare has been unreliable as a public test service.
+    #[ignore = "cloudflare has been unreliable as a public test service"]
     fn test_h3_cloudflare() {
-        // self::env_logger::try_init().ok();
+        subscribe();
 
         let cloudflare = SocketAddr::from(([1, 1, 1, 1], 443));
         let mut request = Message::new();
@@ -607,12 +625,16 @@ mod tests {
 
         let request = DnsRequest::new(request, DnsRequestOptions::default());
 
-        let mut client_config = super::super::client_config_tls13().unwrap();
+        let mut client_config = client_config().unwrap();
         client_config.key_log = Arc::new(KeyLogFile::new());
 
         let mut h3_builder = H3ClientStream::builder();
         h3_builder.crypto_config(client_config);
-        let connect = h3_builder.build(cloudflare, "cloudflare-dns.com".to_string());
+        let connect = h3_builder.build(
+            cloudflare,
+            "cloudflare-dns.com".to_string(),
+            "/dns-query".to_string(),
+        );
 
         // tokio runtime stuff...
         let runtime = Runtime::new().expect("could not start runtime");
@@ -662,12 +684,12 @@ mod tests {
         // use google
         let google = SocketAddr::from(([8, 8, 8, 8], 443));
 
-        let mut client_config = super::super::client_config_tls13().unwrap();
+        let mut client_config = client_config().unwrap();
         client_config.key_log = Arc::new(KeyLogFile::new());
 
         let mut h3_builder = H3ClientStream::builder();
         h3_builder.crypto_config(client_config);
-        let connect = h3_builder.build(google, "dns.google".to_string());
+        let connect = h3_builder.build(google, "dns.google".to_string(), "/dns-query".to_string());
 
         // tokio runtime stuff...
         let runtime = Runtime::new().expect("could not start runtime");

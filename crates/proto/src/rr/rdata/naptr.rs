@@ -274,7 +274,7 @@ impl RecordData for NAPTR {
 ///   care.  See Section 10 for how to correctly enter and escape the
 ///   regular expression.
 ///
-/// ;;      order pref flags service           regexp replacement
+/// ;;      order pflags service           regexp replacement
 /// IN NAPTR 100  50  "a"    "z3950+N2L+N2C"     ""   cidserver.example.com.
 /// IN NAPTR 100  50  "a"    "rcds+N2C"          ""   cidserver.example.com.
 /// IN NAPTR 100  50  "s"    "http+N2L+N2C+N2R"  ""   www.example.com.
@@ -309,7 +309,7 @@ mod tests {
             b"aa11AA".to_vec().into_boxed_slice(),
             b"services".to_vec().into_boxed_slice(),
             b"regexpr".to_vec().into_boxed_slice(),
-            Name::from_str("naptr.example.com").unwrap(),
+            Name::from_str("naptr.example.com.").unwrap(),
         );
 
         let mut bytes = Vec::new();

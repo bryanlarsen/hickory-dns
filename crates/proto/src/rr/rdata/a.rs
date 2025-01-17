@@ -151,21 +151,19 @@ impl str::FromStr for A {
 
 #[cfg(test)]
 mod mytests {
-    use std::str::FromStr;
-
     use super::*;
     use crate::serialize::binary::bin_tests::{test_emit_data_set, test_read_data_set};
 
     fn get_data() -> Vec<(A, Vec<u8>)> {
         vec![
-            (A::from_str("0.0.0.0").unwrap(), vec![0, 0, 0, 0]), // base case
-            (A::from_str("1.0.0.0").unwrap(), vec![1, 0, 0, 0]),
-            (A::from_str("0.1.0.0").unwrap(), vec![0, 1, 0, 0]),
-            (A::from_str("0.0.1.0").unwrap(), vec![0, 0, 1, 0]),
-            (A::from_str("0.0.0.1").unwrap(), vec![0, 0, 0, 1]),
-            (A::from_str("127.0.0.1").unwrap(), vec![127, 0, 0, 1]),
+            (A::from(Ipv4Addr::UNSPECIFIED), vec![0, 0, 0, 0]), // base case
+            (A::from(Ipv4Addr::new(1, 0, 0, 0)), vec![1, 0, 0, 0]),
+            (A::from(Ipv4Addr::new(0, 1, 0, 0)), vec![0, 1, 0, 0]),
+            (A::from(Ipv4Addr::new(0, 0, 1, 0)), vec![0, 0, 1, 0]),
+            (A::from(Ipv4Addr::new(0, 0, 0, 1)), vec![0, 0, 0, 1]),
+            (A::from(Ipv4Addr::LOCALHOST), vec![127, 0, 0, 1]),
             (
-                A::from_str("192.168.64.32").unwrap(),
+                A::from(Ipv4Addr::new(192, 168, 64, 32)),
                 vec![192, 168, 64, 32],
             ),
         ]
@@ -173,11 +171,11 @@ mod mytests {
 
     #[test]
     fn test_parse() {
-        test_read_data_set(get_data(), |ref mut d| A::read(d));
+        test_read_data_set(get_data(), |mut d| A::read(&mut d));
     }
 
     #[test]
     fn test_write_to() {
-        test_emit_data_set(get_data(), |ref mut e, d| d.emit(e));
+        test_emit_data_set(get_data(), |e, d| d.emit(e));
     }
 }

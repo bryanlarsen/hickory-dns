@@ -5,7 +5,7 @@ publish = false
 # A short blurb about the package. This is not rendered in any format when
 # uploaded to crates.io (aka this is not markdown)
 description = """
-Hickory DNS compatability testing library.
+Hickory DNS compatibility testing library.
 """
 
 # These URLs point to more information about the repository
@@ -46,6 +46,8 @@ rand.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-openssl = { workspace = true, features = ["v102", "v110"] }
+hickory-client = { workspace = true, features = ["dnssec-ring"] }
+rustls-pki-types.workspace = true
+test-support.workspace = true
 time.workspace = true
-hickory-client = { workspace = true, features = ["dnssec-openssl"] }
+tokio.workspace = true

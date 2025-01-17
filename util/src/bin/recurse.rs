@@ -30,10 +30,11 @@ use clap::Parser;
 use console::style;
 
 use hickory_proto::op::Query;
+use hickory_proto::rr::RecordType;
+use hickory_proto::xfer::Protocol;
 use hickory_recursor::Recursor;
 use hickory_resolver::{
-    config::{NameServerConfig, NameServerConfigGroup, Protocol},
-    proto::rr::RecordType,
+    config::{NameServerConfig, NameServerConfigGroup},
     Name,
 };
 
@@ -125,6 +126,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket_addr: *socket_addr,
             protocol: Protocol::Tcp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -135,6 +137,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket_addr: *socket_addr,
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,

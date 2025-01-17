@@ -39,8 +39,6 @@ dns-over-https-rustls = [
 ]
 dns-over-quic = ["dns-over-rustls", "hickory-proto/dns-over-quic"]
 
-dns-over-native-tls = ["dns-over-tls", "hickory-proto/dns-over-native-tls"]
-dns-over-openssl = ["dns-over-tls", "dnssec-openssl"]
 dns-over-rustls = [
     "dns-over-tls",
     "dnssec-ring",
@@ -51,9 +49,7 @@ dns-over-tls = []
 webpki-roots = ["hickory-proto/webpki-roots"]
 native-certs = ["hickory-proto/native-certs"]
 
-dnssec-openssl = ["dnssec", "hickory-proto/dnssec-openssl"]
-dnssec-ring = ["dnssec", "hickory-proto/dnssec-ring"]
-dnssec = ["hickory-proto/dnssec"]
+dnssec-ring = ["hickory-proto/dnssec-ring"]
 
 serde = ["dep:serde", "hickory-proto/serde"]
 
@@ -82,7 +78,7 @@ hickory-proto = { workspace = true, features = ["text-parsing", "tokio-runtime"]
 [dev-dependencies]
 futures = { workspace = true, default-features = false, features = ["std", "executor"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
-tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "std"] }
+tracing-subscriber.workspace = true
 webpki-roots = { workspace = true }
 
 [package.metadata.docs.rs]
@@ -93,3 +89,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-all-features]
+skip_optional_dependencies = true
+denylist = ["dnssec"]
+max_combination_size = 2

@@ -32,18 +32,19 @@ use std::{
 
 use clap::{ArgGroup, Parser};
 use console::style;
-use hickory_proto::error::{ProtoError, ProtoErrorKind};
 use tokio::task::JoinSet;
-
-use hickory_proto::rr::{Record, RecordData};
-use hickory_resolver::{
-    config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts},
-    error::ResolveError,
-    lookup::Lookup,
-    proto::rr::RecordType,
-    TokioAsyncResolver,
-};
 use tokio::time::MissedTickBehavior;
+
+use hickory_proto::{
+    rr::{Record, RecordData, RecordType},
+    xfer::Protocol,
+    ProtoError, ProtoErrorKind,
+};
+use hickory_resolver::{
+    config::{NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts},
+    lookup::Lookup,
+    ResolveError, TokioResolver,
+};
 
 /// A CLI interface for the hickory-resolver.
 ///
@@ -177,7 +178,7 @@ fn print_error(error: ResolveError) {
                 style("NoRecordsFound").red(),
                 style(query).blue()
             );
-            if let Some(ref r) = soa {
+            if let Some(r) = soa {
                 print_record(r);
             }
         }
@@ -220,7 +221,7 @@ fn log_query(name: &str, ty: RecordType, name_servers: &str, opts: &Opts) {
 }
 
 async fn execute_query(
-    resolver: Arc<TokioAsyncResolver>,
+    resolver: Arc<TokioResolver>,
     name: String,
     happy: bool,
     reverse: bool,
@@ -275,6 +276,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket_addr: *socket_addr,
             protocol: Protocol::Tcp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -285,6 +287,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket_addr: *socket_addr,
             protocol: Protocol::Udp,
             tls_dns_name: None,
+            http_endpoint: None,
             trust_negative_responses: false,
             #[cfg(feature = "dns-over-rustls")]
             tls_config: None,
@@ -336,7 +339,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
     }
 
-    let resolver_arc = Arc::new(TokioAsyncResolver::tokio(config, options));
+    let resolver_arc = Arc::new(TokioResolver::tokio(config, options));
 
     if let Some(domainname) = &opts.domainname {
         log_query(domainname, opts.ty, &name_servers, &opts);

@@ -1,7 +1,9 @@
 //! Parser for DS text form
 
-use crate::rr::dnssec::rdata::ds::DS;
-use crate::rr::dnssec::{Algorithm, DigestType};
+use std::str::FromStr;
+
+use crate::dnssec::rdata::ds::DS;
+use crate::dnssec::{Algorithm, DigestType};
 use crate::serialize::txt::errors::{ParseError, ParseErrorKind, ParseResult};
 
 /// Parse the RData from a set of Tokens
@@ -48,7 +50,7 @@ pub(crate) fn parse<'i, I: Iterator<Item = &'i str>>(mut tokens: I) -> ParseResu
         "PRIVATEOID" => Algorithm::Unknown(254),
         _ => Algorithm::from_u8(algorithm_str.parse()?),
     };
-    let digest_type = DigestType::from_u8(digest_type_str.parse()?)?;
+    let digest_type = DigestType::try_from(u8::from_str(digest_type_str)?)?;
     let digest_str: String = tokens.collect();
     if digest_str.is_empty() {
         return Err(ParseError::from(ParseErrorKind::Message(
