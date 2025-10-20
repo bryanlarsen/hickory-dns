@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::error::{ProtoError, ProtoErrorKind};
-use crate::rr::Record;
+use crate::rr::{RData, Record};
 #[cfg(feature = "backtrace")]
 use crate::trace;
 
@@ -77,7 +77,7 @@ impl<'a> DnssecIter<'a> {
 }
 
 impl<'a> Iterator for DnssecIter<'a> {
-    type Item = Proven<&'a crate::rr::RData>;
+    type Item = Proven<&'a RData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next().map(|r| r.map(Record::data))
@@ -90,7 +90,7 @@ pub struct DnssecRecordIter<'a>(Box<dyn Iterator<Item = &'a Record> + 'a>);
 impl<'a> DnssecRecordIter<'a> {
     /// Create a new DnssecRecordIter from any iterator of Record references
     pub fn new(iter: impl Iterator<Item = &'a Record> + 'a) -> Self {
-        Self(alloc::boxed::Box::new(iter))
+        Self(Box::new(iter))
     }
 }
 
