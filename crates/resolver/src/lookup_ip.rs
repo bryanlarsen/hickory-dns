@@ -47,7 +47,7 @@ impl LookupIp {
     }
 
     /// Returns a reference to the `Query` that was used to produce this result.
-    pub fn query(&self) -> &Query {
+    pub fn query(&self) -> Option<&Query> {
         self.0.query()
     }
 

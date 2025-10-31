@@ -471,9 +471,15 @@ where
         let now = Instant::now();
 
         match result {
-            Ok((message, ttl)) => {
+            Ok((mut message, ttl)) => {
                 let valid_until = now + Duration::from_secs(ttl.into());
-                let lookup = Lookup::new(query.clone(), message.clone(), valid_until);
+
+                // Ensure the query is in the message
+                if message.queries().is_empty() {
+                    message.add_query(query.clone());
+                }
+
+                let lookup = Lookup::new(message.clone(), valid_until);
 
                 self.cache.insert(query, Ok(message), now);
 
@@ -510,10 +516,10 @@ fn records_to_lookup(query: Query, records: &[Record], now: Instant) -> Lookup {
     let valid_until = now + Duration::from_secs(ttl.into());
 
     let mut message = Message::response(0, OpCode::Query);
-    message.add_query(query.clone());
+    message.add_query(query);
     message.add_answers(records.iter().cloned());
 
-    Lookup::new(query, message, valid_until)
+    Lookup::new(message, valid_until)
 }
 
 // see also the lookup_tests.rs in integration-tests crate
@@ -1428,11 +1434,7 @@ mod tests {
         };
 
         // Create a Lookup from the final message
-        let lookup = Lookup::new(
-            Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A),
-            lookup_message,
-            Instant::now() + Duration::from_secs(300),
-        );
+        let lookup = Lookup::new(lookup_message, Instant::now() + Duration::from_secs(300));
 
         // Verify ANSWER: Only final A record (CNAME from Response 1 filtered)
         assert_eq!(
@@ -1603,11 +1605,7 @@ mod tests {
         };
 
         // Create a Lookup from the final message
-        let lookup = Lookup::new(
-            Query::query(Name::from_str("www.example.com.").unwrap(), RecordType::A),
-            lookup_message,
-            Instant::now() + Duration::from_secs(300),
-        );
+        let lookup = Lookup::new(lookup_message, Instant::now() + Duration::from_secs(300));
 
         // Verify ANSWER: CNAME from Response 1 + A from Response 2
         assert_eq!(
@@ -1719,7 +1717,7 @@ mod tests {
             let query = Query::query(Name::from_ascii("localhost.").unwrap(), RecordType::A);
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
-            assert_eq!(lookup.query(), &query);
+            assert_eq!(lookup.query(), Some(&query));
             assert_eq!(
                 lookup.answers(),
                 &[Record::from_rdata(
@@ -1734,7 +1732,7 @@ mod tests {
             let query = Query::query(Name::from_ascii("localhost.").unwrap(), RecordType::AAAA);
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
-            assert_eq!(lookup.query(), &query);
+            assert_eq!(lookup.query(), Some(&query));
             assert_eq!(
                 lookup.answers(),
                 &[Record::from_rdata(
@@ -1749,7 +1747,7 @@ mod tests {
             let query = Query::query(Name::from(Ipv4Addr::LOCALHOST), RecordType::PTR);
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
-            assert_eq!(lookup.query(), &query);
+            assert_eq!(lookup.query(), Some(&query));
             assert_eq!(
                 lookup.answers(),
                 &[Record::from_rdata(
@@ -1767,7 +1765,7 @@ mod tests {
             );
             let lookup = block_on(client.lookup(query.clone(), DnsRequestOptions::default()))
                 .expect("should have returned localhost");
-            assert_eq!(lookup.query(), &query);
+            assert_eq!(lookup.query(), Some(&query));
             assert_eq!(
                 lookup.answers(),
                 &[Record::from_rdata(

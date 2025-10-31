@@ -26,21 +26,16 @@ use crate::{
 /// For IP resolution see LookupIp, as it has more features for A and AAAA lookups.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lookup {
-    // TODO: the query field here is redundant and should be removed.
-    // All messages should have at least one query in them, and the
-    // query is also the key in the ResponseCache where Lookup is
-    // typically used. Removing this field will force users to deal
-    // with non-compliant messages that don't contain a query.
-    query: Query,
     message: Message,
     valid_until: Instant,
 }
 
 impl Lookup {
     /// Create a new Lookup from a complete DNS Message.
-    pub fn new(query: Query, message: Message, valid_until: Instant) -> Self {
+    ///
+    /// The message should already contain the query in its queries section.
+    pub fn new(message: Message, valid_until: Instant) -> Self {
         Self {
-            query,
             message,
             valid_until,
         }
@@ -66,15 +61,17 @@ impl Lookup {
         message.add_answers(records.iter().cloned());
 
         Self {
-            query,
             message,
             valid_until,
         }
     }
 
     /// Returns a reference to the `Query` that was used to produce this result.
-    pub fn query(&self) -> &Query {
-        &self.query
+    ///
+    /// Returns `None` if the message has no queries (which should
+    /// never happen for a compliant DNS message).
+    pub fn query(&self) -> Option<&Query> {
+        self.message.queries().first()
     }
 
     /// Returns a reference to the underlying DNS Message.
@@ -170,7 +167,6 @@ mod tests {
         message.add_answers([a1.clone(), a2.clone()]);
 
         let lookup = Lookup {
-            query: Query::default(),
             message,
             valid_until: Instant::now(),
         };
@@ -222,7 +218,6 @@ mod tests {
         )]);
 
         let mut lookup = Lookup {
-            query,
             message,
             valid_until: Instant::now(),
         };
@@ -285,7 +280,6 @@ mod tests {
         )]);
 
         let lookup1 = Lookup {
-            query: query.clone(),
             message: message1,
             valid_until: Instant::now(),
         };
@@ -310,7 +304,6 @@ mod tests {
         )]);
 
         let lookup2 = Lookup {
-            query,
             message: message2,
             valid_until: Instant::now(),
         };
