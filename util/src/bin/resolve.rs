@@ -149,10 +149,15 @@ fn print_record<D: RecordData, R: Deref<Target = Record<D>>>(r: &R) {
 }
 
 fn print_ok(lookup: Lookup) {
+    let query_display = lookup
+        .query()
+        .map(|q| format!("{}", q))
+        .unwrap_or_else(|| "<no query>".to_string());
+
     println!(
         "{} for query {}",
         style("Success").green(),
-        style(lookup.query()).blue()
+        style(query_display).blue()
     );
 
     let message = lookup.message();
