@@ -11,8 +11,14 @@ use std::sync::Arc;
 
 use cfg_if::cfg_if;
 
+use crate::proto::{
+    op::Message,
+    rr::{LowerName, Record, RecordSet, RecordType, RrsetRecords},
+};
+#[cfg(feature = "resolver")]
+use crate::resolver::lookup::Lookup;
+
 use crate::authority::{LookupObject, LookupOptions};
-use crate::proto::rr::{LowerName, Record, RecordSet, RecordType, RrsetRecords};
 
 /// The result of a lookup on an Authority
 ///
@@ -45,6 +51,11 @@ pub enum AuthLookup {
         /// The last SOA record of an AXFR (matches the first)
         end_soa: LookupRecords,
     },
+    /// Records resulting from a resolver lookup
+    #[cfg(feature = "resolver")]
+    Resolved(Lookup),
+    /// A response message
+    Response(Message),
 }
 
 impl AuthLookup {
@@ -130,6 +141,13 @@ impl<'a> IntoIterator for &'a AuthLookup {
                 records,
                 end_soa,
             } => AuthLookupIter::AXFR(start_soa.into_iter().chain(records).chain(end_soa)),
+            #[cfg(feature = "resolver")]
+            AuthLookup::Resolved(lookup) => {
+                // FIXME: do we want just answers() here, like AuthLookup::Response?   It would be simpler / more efficient.   But using all_sections for now for backwards compatibility.
+                let records: Vec<&Record> = lookup.message().all_sections().collect();
+                AuthLookupIter::Resolved(records.into_iter())
+            }
+            AuthLookup::Response(message) => AuthLookupIter::Response(message.answers().iter()),
         }
     }
 }
@@ -145,6 +163,11 @@ pub enum AuthLookupIter<'r> {
     Records(LookupRecordsIter<'r>),
     /// An iteration over an AXFR
     AXFR(Chain<Chain<LookupRecordsIter<'r>, LookupRecordsIter<'r>>, LookupRecordsIter<'r>>),
+    /// An iteration over resolved records
+    #[cfg(feature = "resolver")]
+    Resolved(std::vec::IntoIter<&'r Record>),
+    /// An iterator over the answer section of a response message
+    Response(Iter<'r, Record>),
 }
 
 impl<'r> Iterator for AuthLookupIter<'r> {
@@ -155,6 +178,9 @@ impl<'r> Iterator for AuthLookupIter<'r> {
             AuthLookupIter::Empty => None,
             AuthLookupIter::Records(i) => i.next(),
             AuthLookupIter::AXFR(i) => i.next(),
+            #[cfg(feature = "resolver")]
+            AuthLookupIter::Resolved(i) => i.next(),
+            AuthLookupIter::Response(i) => i.next(),
         }
     }
 }

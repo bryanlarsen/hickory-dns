@@ -371,7 +371,7 @@ impl RecursorDnsHandle {
         }
 
         if !cname_chain.is_empty() {
-            lookup.extend_records(cname_chain);
+            lookup.extend_answers(cname_chain);
         }
 
         Ok(lookup)
