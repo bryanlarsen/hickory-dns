@@ -395,6 +395,7 @@ impl DnsLru {
     }
 
     /// Generally for inserting a set of records that have already been cached, but with a different Query.
+    #[allow(dead_code)]
     pub(crate) fn duplicate(&self, query: Query, lookup: Lookup, ttl: u32, now: Instant) -> Lookup {
         let ttl = Duration::from_secs(u64::from(ttl));
         let valid_until = now + ttl;

@@ -19,7 +19,7 @@ use std::time::Instant;
 use futures_util::{FutureExt, future, future::Either};
 use tracing::debug;
 
-use crate::proto::op::Query;
+use crate::proto::op::{Message, Query};
 use crate::proto::rr::{Name, RData, Record, RecordType};
 use crate::proto::xfer::{DnsHandle, DnsRequestOptions};
 
@@ -41,7 +41,7 @@ impl LookupIp {
     ///
     /// Only IP records will be returned, either A or AAAA record types.
     pub fn iter(&self) -> LookupIpIter<'_> {
-        LookupIpIter(self.0.iter())
+        LookupIpIter(LookupIter::new(self.0.message().answers().iter()))
     }
 
     /// Returns a reference to the `Query` that was used to produce this result.
@@ -52,6 +52,11 @@ impl LookupIp {
     /// Returns the `Instant` at which this lookup is no longer valid.
     pub fn valid_until(&self) -> Instant {
         self.0.valid_until()
+    }
+
+    /// Returns a reference to the underlying DNS Message
+    pub fn as_message(&self) -> &Message {
+        self.0.message()
     }
 
     /// Return a reference to the inner lookup

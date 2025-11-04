@@ -9,8 +9,8 @@
 
 use std::{
     cmp::min,
+    marker::PhantomData,
     pin::Pin,
-    slice::Iter,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,13 +22,10 @@ use crate::{
     lookup_ip::LookupIpIter,
     name_server::{ConnectionProvider, NameServerPool},
     proto::{
-        DnsHandle, ProtoError, RetryDnsHandle,
-        op::Query,
-        rr::{
-            RData, Record,
-            rdata::{self, A, AAAA, NS, PTR},
-        },
-        xfer::{DnsRequest, DnsResponse},
+        op::{Message, MessageType, OpCode, Query},
+        rr::{RData, Record, RecordData, rdata},
+        xfer::{DnsHandle, DnsRequest, DnsResponse},
+        {ProtoError, RetryDnsHandle},
     },
 };
 
@@ -41,11 +38,20 @@ use crate::proto::dnssec::{DnssecDnsHandle, Proven};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lookup {
     query: Query,
-    records: Arc<[Record]>,
+    message: Message,
     valid_until: Instant,
 }
 
 impl Lookup {
+    /// Create a new Lookup from a complete DNS Message.
+    pub fn new(query: Query, message: Message, valid_until: Instant) -> Self {
+        Self {
+            query,
+            message,
+            valid_until,
+        }
+    }
+
     /// Return new instance with given rdata and the maximum TTL.
     pub fn from_rdata(query: Query, rdata: RData) -> Self {
         let record = Record::from_rdata(query.name().clone(), MAX_TTL, rdata);
@@ -55,18 +61,25 @@ impl Lookup {
     /// Return new instance with given records and the maximum TTL.
     pub fn new_with_max_ttl(query: Query, records: Arc<[Record]>) -> Self {
         let valid_until = Instant::now() + Duration::from_secs(u64::from(MAX_TTL));
-        Self {
-            query,
-            records,
-            valid_until,
-        }
+        Self::new_with_deadline(query, records, valid_until)
     }
 
     /// Return a new instance with the given records and deadline.
     pub fn new_with_deadline(query: Query, records: Arc<[Record]>, valid_until: Instant) -> Self {
+        // Build a response Message with the records in the answers section
+        let mut message = {
+            let mut m = Message::new();
+            m.set_message_type(MessageType::Response)
+                .set_id(0)
+                .set_op_code(OpCode::Query);
+            m
+        };
+        message.add_query(query.clone());
+        message.add_answers(records.iter().cloned());
+
         Self {
             query,
-            records,
+            message,
             valid_until,
         }
     }
@@ -76,30 +89,40 @@ impl Lookup {
         &self.query
     }
 
+    /// Returns a reference to the underlying DNS Message.
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
+
     /// Returns an iterator over the data of all records returned during the query.
     ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
     /// It may include additional record types beyond the queried type, e.g. CNAME.
     pub fn iter(&self) -> LookupIter<'_> {
-        LookupIter(self.records.iter())
+        LookupIter::new(self.message.all_sections())
     }
 
     /// Returns a borrowed iterator of the returned data wrapped in a dnssec Proven type
+    ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
     #[cfg(feature = "__dnssec")]
     pub fn dnssec_iter(&self) -> DnssecIter<'_> {
-        DnssecIter(self.dnssec_record_iter())
+        DnssecIter(DnssecLookupRecordIter::new(self.message.all_sections()))
     }
 
-    /// Returns an iterator over all records returned during the query.
+    /// Returns an iterator over the records returned during the query.
     ///
-    /// It may include additional record types beyond the queried type, e.g. CNAME.
-    pub fn record_iter(&self) -> LookupRecordIter<'_> {
-        LookupRecordIter(self.records.iter())
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
+    pub fn record_iter(&self) -> Box<dyn Iterator<Item = &Record> + Send + '_> {
+        Box::new(self.message.all_sections())
     }
 
     /// Returns a borrowed iterator of the returned records wrapped in a dnssec Proven type
+    ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
     #[cfg(feature = "__dnssec")]
     pub fn dnssec_record_iter(&self) -> DnssecLookupRecordIter<'_> {
-        DnssecLookupRecordIter(self.records.iter())
+        DnssecLookupRecordIter::new(self.message.all_sections())
     }
 
     /// Returns the `Instant` at which this `Lookup` is no longer valid.
@@ -109,41 +132,67 @@ impl Lookup {
 
     #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        // For backwards compatibility, check all sections
+        self.message.all_sections().next().is_none()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
-        self.records.len()
+        // For backwards compatibility, count all sections
+        self.message.all_sections().count()
     }
 
-    /// Returns an slice over all records that were returned during the query, this can include
+    /// Returns all records that were returned during the query, this can include
     ///   additional record types beyond the queried type, e.g. CNAME.
-    pub fn records(&self) -> &[Record] {
-        self.records.as_ref()
+    ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
+    /// Note: This allocates and clones records on each call.
+    pub fn records(&self) -> Arc<[Record]> {
+        self.message.all_sections().cloned().collect()
     }
 
-    /// Clones the inner vec, appends the other vec
+    /// Combine two lookup results, preserving section structure
+    ///
+    /// Appends records from each section of `other` to the corresponding section of `self`.
     pub(crate) fn append(&self, other: Self) -> Self {
-        let mut records = Vec::with_capacity(self.len() + other.len());
-        records.extend_from_slice(&self.records);
-        records.extend_from_slice(&other.records);
+        // Clone self to get a mutable copy
+        let mut result = self.clone();
 
-        // Choose the sooner deadline of the two lookups.
-        let valid_until = min(self.valid_until(), other.valid_until());
-        Self::new_with_deadline(self.query.clone(), Arc::from(records), valid_until)
+        // Append each section separately to preserve structure
+        result
+            .message
+            .add_answers(other.message.answers().iter().cloned());
+        result
+            .message
+            .add_name_servers(other.message.name_servers().iter().cloned());
+        result
+            .message
+            .add_additionals(other.message.additionals().iter().cloned());
+
+        // Choose the sooner deadline of the two lookups
+        result.valid_until = min(self.valid_until(), other.valid_until());
+
+        result
     }
 
     /// Add new records to this lookup, without creating a new Lookup
-    pub fn extend_records(&mut self, other: Vec<Record>) {
-        let mut records = Vec::with_capacity(self.len() + other.len());
-        records.extend_from_slice(&self.records);
-        records.extend(other);
-        self.records = Arc::from(records);
+    ///
+    /// Records are added to the ANSWERS section while preserving existing section structure
+    pub fn extend_answers(&mut self, other: Vec<Record>) {
+        // Add new records to the answers section, preserving existing sections
+        self.message.add_answers(other);
     }
 }
 
 /// Borrowed view of set of [`RData`]s returned from a Lookup
-pub struct LookupIter<'a>(Iter<'a, Record>);
+pub struct LookupIter<'a>(Box<dyn Iterator<Item = &'a Record> + 'a>);
+
+impl<'a> LookupIter<'a> {
+    /// Create a new LookupIter from an iterator over Records
+    pub(crate) fn new(iter: impl Iterator<Item = &'a Record> + 'a) -> Self {
+        Self(Box::new(iter))
+    }
+}
 
 impl<'a> Iterator for LookupIter<'a> {
     type Item = &'a RData;
@@ -166,20 +215,16 @@ impl<'a> Iterator for DnssecIter<'a> {
     }
 }
 
-/// Borrowed view of set of [`Record`]s returned from a Lookup
-pub struct LookupRecordIter<'a>(Iter<'a, Record>);
-
-impl<'a> Iterator for LookupRecordIter<'a> {
-    type Item = &'a Record;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
-    }
-}
-
 /// An iterator over record data with all data wrapped in a Proven type for dnssec validation
 #[cfg(feature = "__dnssec")]
-pub struct DnssecLookupRecordIter<'a>(Iter<'a, Record>);
+pub struct DnssecLookupRecordIter<'a>(Box<dyn Iterator<Item = &'a Record> + 'a>);
+
+#[cfg(feature = "__dnssec")]
+impl<'a> DnssecLookupRecordIter<'a> {
+    fn new(iter: impl Iterator<Item = &'a Record> + 'a) -> Self {
+        Self(Box::new(iter))
+    }
+}
 
 #[cfg(feature = "__dnssec")]
 impl<'a> Iterator for DnssecLookupRecordIter<'a> {
@@ -197,8 +242,10 @@ impl IntoIterator for Lookup {
 
     /// This is not a free conversion, because the `RData`s are cloned.
     fn into_iter(self) -> Self::IntoIter {
+        // Convert answers to Arc<[Record]> for iteration
+        let answers: Arc<[Record]> = Arc::from(self.message.answers());
         LookupIntoIter {
-            records: Arc::clone(&self.records),
+            records: answers,
             index: 0,
         }
     }
@@ -257,8 +304,10 @@ pub struct SrvLookup(Lookup);
 
 impl SrvLookup {
     /// Returns an iterator over the SRV RData
+    ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
     pub fn iter(&self) -> SrvLookupIter<'_> {
-        SrvLookupIter(self.0.iter())
+        SrvLookupIter(LookupIter::new(self.0.message().all_sections()))
     }
 
     /// Returns a reference to the Query that was used to produce this result.
@@ -270,7 +319,14 @@ impl SrvLookup {
     ///
     /// *Note*: That Hickory DNS performs a recursive lookup on SRV records for IPs if they were not included in the original request. If there are no IPs associated to the result, a subsequent query for the IPs via the `srv.target()` should not resolve to the IPs.
     pub fn ip_iter(&self) -> LookupIpIter<'_> {
-        LookupIpIter(self.0.iter())
+        // Use all_sections() to get IPs from ANSWER and ADDITIONAL sections
+        // (ADDITIONAL may contain glue records for SRV targets)
+        LookupIpIter(LookupIter::new(self.0.message().all_sections()))
+    }
+
+    /// Returns a reference to the underlying DNS Message
+    pub fn as_message(&self) -> &Message {
+        self.0.message()
     }
 
     /// Return a reference to the inner lookup
@@ -302,13 +358,58 @@ impl<'i> Iterator for SrvLookupIter<'i> {
     }
 }
 
-impl IntoIterator for SrvLookup {
-    type Item = rdata::SRV;
-    type IntoIter = SrvLookupIntoIter;
+/// Contains the results of a lookup for the associated RecordType
+#[derive(Debug, Clone)]
+pub struct TypedLookup<T> {
+    inner: Lookup,
+    _marker: PhantomData<T>,
+}
 
-    /// This is not a free conversion, because the `RData`s are cloned.
-    fn into_iter(self) -> Self::IntoIter {
-        SrvLookupIntoIter(self.0.into_iter())
+impl<T> TypedLookup<T> {
+    /// Returns an iterator over the matching records
+    ///
+    /// For backwards compatibility, this returns records from all sections (ANSWER, AUTHORITY, ADDITIONAL).
+    pub fn iter(&self) -> TypedLookupIter<'_, T> {
+        TypedLookupIter {
+            inner: LookupIter::new(self.inner.message().all_sections()),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns a reference to the Query that was used to produce this result.
+    pub fn query(&self) -> &Query {
+        self.inner.query()
+    }
+
+    /// Returns the `Instant` at which this result is no longer valid.
+    pub fn valid_until(&self) -> Instant {
+        self.inner.valid_until()
+    }
+
+    /// Returns a reference to the underlying DNS Message
+    pub fn as_message(&self) -> &Message {
+        self.inner.message()
+    }
+
+    /// Return a reference to the inner lookup
+    ///
+    /// This can be useful for getting all records from the request
+    pub fn as_lookup(&self) -> &Lookup {
+        &self.inner
+    }
+}
+
+/// Borrowed view of set of typed RDatas returned from a TypedLookup
+pub struct TypedLookupIter<'i, T> {
+    inner: LookupIter<'i>,
+    _marker: PhantomData<T>,
+}
+
+impl<'i, T: RecordData + 'i> Iterator for TypedLookupIter<'i, T> {
+    type Item = &'i T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.find_map(T::try_borrow)
     }
 }
 
@@ -418,15 +519,21 @@ lookup_type!(
     ReverseLookupIter,
     ReverseLookupIntoIter,
     RData::PTR,
-    PTR
+    rdata::PTR
 );
-lookup_type!(Ipv4Lookup, Ipv4LookupIter, Ipv4LookupIntoIter, RData::A, A);
+lookup_type!(
+    Ipv4Lookup,
+    Ipv4LookupIter,
+    Ipv4LookupIntoIter,
+    RData::A,
+    rdata::A
+);
 lookup_type!(
     Ipv6Lookup,
     Ipv6LookupIter,
     Ipv6LookupIntoIter,
     RData::AAAA,
-    AAAA
+    rdata::AAAA
 );
 lookup_type!(
     MxLookup,
@@ -463,22 +570,28 @@ lookup_type!(
     RData::SOA,
     rdata::SOA
 );
-lookup_type!(NsLookup, NsLookupIter, NsLookupIntoIter, RData::NS, NS);
+lookup_type!(
+    NsLookup,
+    NsLookupIter,
+    NsLookupIntoIter,
+    RData::NS,
+    rdata::NS
+);
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    #[cfg(feature = "__dnssec")]
     use crate::proto::op::Query;
+    use crate::proto::rr::rdata::A;
     use crate::proto::rr::{Name, RData, Record};
 
     use super::*;
 
     #[test]
     fn test_lookup_into_iter_arc() {
-        let mut lookup = LookupIntoIter {
+        let lookup = LookupIntoIter {
             records: Arc::from([
                 Record::from_rdata(
                     Name::from_str("www.example.com.").unwrap(),
@@ -494,9 +607,10 @@ mod tests {
             index: 0,
         };
 
-        assert_eq!(lookup.next().unwrap(), RData::A(A::new(127, 0, 0, 1)));
-        assert_eq!(lookup.next().unwrap(), RData::A(A::new(127, 0, 0, 2)));
-        assert_eq!(lookup.next(), None);
+        let mut iter = LookupIter::new(lookup.records.iter());
+        assert_eq!(iter.next().unwrap(), &RData::A(A::new(127, 0, 0, 1)));
+        assert_eq!(iter.next().unwrap(), &RData::A(A::new(127, 0, 0, 2)));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
@@ -518,9 +632,20 @@ mod tests {
         );
         a2.set_proof(Proof::Insecure);
 
+        // Build a response Message with the records
+        let mut message = {
+            let mut m = Message::new();
+            m.set_message_type(MessageType::Response)
+                .set_id(0)
+                .set_op_code(OpCode::Query);
+            m
+        };
+        message.add_query(Query::default());
+        message.add_answers([a1.clone(), a2.clone()]);
+
         let lookup = Lookup {
             query: Query::default(),
-            records: Arc::from([a1.clone(), a2.clone()]),
+            message,
             valid_until: Instant::now(),
         };
 
@@ -535,5 +660,195 @@ mod tests {
             *a2.data()
         );
         assert_eq!(lookup.next(), None);
+    }
+
+    #[test]
+    fn test_extend_answers_preserves_sections() {
+        use crate::proto::rr::rdata::NS;
+
+        // Create a message with records in different sections
+        let mut message = {
+            let mut m = Message::new();
+            m.set_message_type(MessageType::Response)
+                .set_id(0)
+                .set_op_code(OpCode::Query);
+            m
+        };
+        let query = Query::query(
+            Name::from_str("www.example.com.").unwrap(),
+            crate::proto::rr::RecordType::A,
+        );
+        message.add_query(query.clone());
+
+        // Add answer
+        message.add_answers(vec![Record::from_rdata(
+            Name::from_str("www.example.com.").unwrap(),
+            80,
+            RData::A(A::new(127, 0, 0, 1)),
+        )]);
+
+        // Add authority
+        message.add_name_servers(vec![Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            80,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        )]);
+
+        // Add additional
+        message.add_additionals(vec![Record::from_rdata(
+            Name::from_str("ns1.example.com.").unwrap(),
+            80,
+            RData::A(A::new(192, 0, 2, 1)),
+        )]);
+
+        let mut lookup = Lookup {
+            query,
+            message,
+            valid_until: Instant::now(),
+        };
+
+        // Extend with new answer record
+        let new_record = Record::from_rdata(
+            Name::from_str("www.example.com.").unwrap(),
+            80,
+            RData::A(A::new(127, 0, 0, 2)),
+        );
+        lookup.extend_answers(vec![new_record.clone()]);
+
+        // Verify that lookup.message was updated (not just a temporary reference)
+        assert_eq!(lookup.message.answers().len(), 2);
+        assert_eq!(lookup.message.answers()[1], new_record);
+
+        // Verify sections were preserved
+        assert_eq!(lookup.message.name_servers().len(), 1);
+        assert_eq!(lookup.message.additionals().len(), 1);
+
+        // Verify the authority and additional records are intact
+        if let RData::NS(ns) = lookup.message.name_servers()[0].data() {
+            assert_eq!(ns.0, Name::from_str("ns1.example.com.").unwrap());
+        } else {
+            panic!("Authority record should be NS");
+        }
+
+        if let RData::A(a) = lookup.message.additionals()[0].data() {
+            assert_eq!(*a, A::new(192, 0, 2, 1));
+        } else {
+            panic!("Additional record should be A");
+        }
+    }
+
+    #[test]
+    fn test_append_preserves_sections() {
+        use crate::proto::rr::rdata::NS;
+
+        // Create first lookup with records in all sections
+        let mut message1 = {
+            let mut m = Message::new();
+            m.set_message_type(MessageType::Response)
+                .set_id(0)
+                .set_op_code(OpCode::Query);
+            m
+        };
+        let query = Query::query(
+            Name::from_str("www.example.com.").unwrap(),
+            crate::proto::rr::RecordType::A,
+        );
+        message1.add_query(query.clone());
+        message1.add_answers(vec![Record::from_rdata(
+            Name::from_str("www.example.com.").unwrap(),
+            80,
+            RData::A(A::new(127, 0, 0, 1)),
+        )]);
+        message1.add_name_servers(vec![Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            80,
+            RData::NS(NS(Name::from_str("ns1.example.com.").unwrap())),
+        )]);
+        message1.add_additionals(vec![Record::from_rdata(
+            Name::from_str("ns1.example.com.").unwrap(),
+            80,
+            RData::A(A::new(192, 0, 2, 1)),
+        )]);
+
+        let lookup1 = Lookup {
+            query: query.clone(),
+            message: message1,
+            valid_until: Instant::now(),
+        };
+
+        // Create second lookup with different records in all sections
+        let mut message2 = {
+            let mut m = Message::new();
+            m.set_message_type(MessageType::Response)
+                .set_id(0)
+                .set_op_code(OpCode::Query);
+            m
+        };
+        message2.add_query(query.clone());
+        message2.add_answers(vec![Record::from_rdata(
+            Name::from_str("www.example.com.").unwrap(),
+            80,
+            RData::A(A::new(127, 0, 0, 2)),
+        )]);
+        message2.add_name_servers(vec![Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            80,
+            RData::NS(NS(Name::from_str("ns2.example.com.").unwrap())),
+        )]);
+        message2.add_additionals(vec![Record::from_rdata(
+            Name::from_str("ns2.example.com.").unwrap(),
+            80,
+            RData::A(A::new(192, 0, 2, 2)),
+        )]);
+
+        let lookup2 = Lookup {
+            query,
+            message: message2,
+            valid_until: Instant::now(),
+        };
+
+        // Append lookup2 to lookup1
+        let combined = lookup1.append(lookup2);
+
+        // Verify that sections were preserved and combined
+        assert_eq!(combined.message.answers().len(), 2);
+        assert_eq!(combined.message.name_servers().len(), 2);
+        assert_eq!(combined.message.additionals().len(), 2);
+
+        // Verify answer records
+        if let RData::A(a) = combined.message.answers()[0].data() {
+            assert_eq!(*a, A::new(127, 0, 0, 1));
+        } else {
+            panic!("First answer should be A");
+        }
+        if let RData::A(a) = combined.message.answers()[1].data() {
+            assert_eq!(*a, A::new(127, 0, 0, 2));
+        } else {
+            panic!("Second answer should be A");
+        }
+
+        // Verify authority records
+        if let RData::NS(ns) = combined.message.name_servers()[0].data() {
+            assert_eq!(ns.0, Name::from_str("ns1.example.com.").unwrap());
+        } else {
+            panic!("First authority should be NS");
+        }
+        if let RData::NS(ns) = combined.message.name_servers()[1].data() {
+            assert_eq!(ns.0, Name::from_str("ns2.example.com.").unwrap());
+        } else {
+            panic!("Second authority should be NS");
+        }
+
+        // Verify additional records
+        if let RData::A(a) = combined.message.additionals()[0].data() {
+            assert_eq!(*a, A::new(192, 0, 2, 1));
+        } else {
+            panic!("First additional should be A");
+        }
+        if let RData::A(a) = combined.message.additionals()[1].data() {
+            assert_eq!(*a, A::new(192, 0, 2, 2));
+        } else {
+            panic!("Second additional should be A");
+        }
     }
 }
